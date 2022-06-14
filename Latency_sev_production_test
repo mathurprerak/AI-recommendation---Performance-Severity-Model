@@ -1,0 +1,3906 @@
+-- set session resource_pool = general;
+
+--update the coral source view to reflect the new table columns
+-- create or replace view coral0.coral_source_view as select c.*, a."Account Id", a."SFDC Date" from coral0.coral_source c join sfdc0.asset_byday a on c."sn" = a."Asset SN" and date(c."ts") = a."SFDC Date";
+
+drop table if exists current_coral_batch;
+create local temp table current_coral_batch on commit preserve rows as with
+coral_timeline as (select array_sn, max(ts) as max_coral_ts,
+case when max(ts) < now() - interval '7 days' then now() - interval '7 days' else max(ts) - interval '35 minutes' end as coral_start_ts
+from coral0.array_lvl_coral
+-- where array_sn in (select array_sn from monitor0.current_coral_batch_precursor_<NODE>) 
+group by array_sn
+),
+
+sensors_timeline as (select "Array SN", max("Sensors Local Timestamp") as max_sensors_ts,
+case when max("Sensors Local Timestamp") > now() + interval '2 days' then now() + interval '2 days' else max("Sensors Local Timestamp") end as coral_end_ts
+from sensors0.array_ds_sys_diff --where "Array SN" in (select array_sn from monitor0.current_coral_batch_precursor_<NODE>) 
+group by "Array SN"),
+
+customer_timeline as (select "Array SN", "Array Type", "Customer Name" from
+(select "Array SN",
+    case
+    when REGEXP_LIKE("Array Model",'^AF[0-9]+.*$') then 'all-flash'
+    when REGEXP_LIKE("Array Model",'^CS.*$') then 'adaptive-flash'
+    when REGEXP_LIKE("Array Model",'^HF.*$') then 'adaptive-flash'
+    else 'unknown' end as "Array Type",
+"Customer Name", row_number() over (partition by "Array SN" order by "ASUP Local Date" desc) as rn from cube0.arrays_byday --where "Array SN" in (select array_sn from monitor0.current_coral_batch_precursor_<NODE>)
+) x 
+where rn = 1),
+
+account_timeline as (select * from (select "Asset SN", "Account Id", row_number() over (partition by "Asset SN" order by "SFDC Date" desc) as rn from sfdc0.asset_byday --where "Asset SN" in (select array_sn from monitor0.current_coral_batch_precursor_<NODE>)
+) x where rn = 1)
+
+select "Account Id" as account_id, "Array Type" as array_type, "Customer Name" as company, s."Array SN" as sn, max_coral_ts, coalesce(coral_start_ts, now() - interval '3 days') as coral_start_ts, coral_end_ts
+from sensors_timeline s
+left outer join coral_timeline c on s."Array SN" = c.array_sn
+inner join customer_timeline u on s."Array SN" = u."Array SN"
+left outer join account_timeline a on s."Array SN" = a."Asset SN"
+where (max_coral_ts is null or max_coral_ts < coral_end_ts);
+
+
+select count(*) from current_coral_batch; --2155
+select * from current_coral_batch limit 10;
+-- select 'CORAL BATCH DEFINITION';
+-- select * from current_coral_batch;
+
+
+-- -- AN EXAMPLE FOR MANUAL RUNNING OF array_lvl_perf_joined
+-- drop table if exists array_lvl_perf_pipeline_scope;
+-- create local temp table array_lvl_perf_pipeline_scope on commit preserve rows as
+-- select distinct
+-- "Array SN" as array_sn,
+-- '2018-05-24,00:00:00'::TIMESTAMP AS start_ts,
+-- '2018-05-25,00:00:00'::TIMESTAMP AS end_ts
+-- from cube0.arrays_current where "Array SN" = 'AF-130045';
+-- drop table if exists current_coral_batch;
+-- create local temp table current_coral_batch on commit preserve rows as
+-- select 'adamsonTEST' as account_id, 'adamsonTEST' as company, 'HFA' as array_type,
+-- array_sn as sn, start_ts as coral_start_ts, end_ts as coral_end_ts
+-- from array_lvl_perf_pipeline_scope;
+
+
+drop table if exists array_lvl_perf_pipeline_scope;
+create local temp table array_lvl_perf_pipeline_scope on commit preserve rows as select
+sn as array_sn,
+coral_start_ts as start_ts,
+coral_end_ts as end_ts
+from current_coral_batch;
+
+select count(*),count(distinct array_sn),min(start_ts),max(start_ts) from array_lvl_perf_pipeline_scope;
+select * from array_lvl_perf_pipeline_scope limit 10;
+
+drop table if exists dssysdiff;
+create local temp table dssysdiff on commit preserve rows as 
+select
+  "Array SN" as sn,
+  "Array Hostname" as hn,
+  "Sensors Local Date" as day,
+  "Sensors Local Timestamp" as ts,
+  "Sensors Local Epoch" as epo,
+  round("seqStreamWriteCount"/60.0)::float as swops,
+  round(("writes"-"seqStreamWriteCount")/60.0)::float as rwops,
+  round("seqStreamReadCount"/60.0)::float as srops,
+  round(("reads"-"seqStreamReadCount")/60.0)::float as rrops,
+  round(("seqStreamWriteBytes")/(60.0*1024.0*1024.0))::float as swmbps,
+  round(("writeBytes"-"seqStreamWriteBytes")/(60.0*1024.0*1024.0))::float as rwmbps,
+  round("seqStreamReadBytes"/(60.0*1024.0*1024.0))::float as srmbps,
+  round(("readBytes"-"seqStreamReadBytes")/(60.0*1024.0*1024.0))::float as rrmbps,
+  round(ZEROIFNULL("readBytes"/NULLIFZERO(1024.0*"reads")),4)::float as kbpr,
+  round(ZEROIFNULL("writeBytes"/NULLIFZERO(1024.0*"writes")),4)::float as kbpw,
+  round(ZEROIFNULL(100.0-100.0*("nsReadsHitMem"+"nsReadsHitSsd")/NULLIFZERO("reads"-"seqStreamReadCount")),4)::float as ns_ssd_miss_pct,
+  round(ZEROIFNULL(100.0-100.0*("seqReadsHitMem"+"seqReadsHitSsd")/NULLIFZERO("seqStreamReadCount")),4)::float as seq_ssd_miss_pct,
+  round(ZEROIFNULL(100.0-100.0*("nsReadsHitMem")/NULLIFZERO("reads"-"seqStreamReadCount")),4)::float as ns_mem_miss_pct,
+  round(ZEROIFNULL(100.0-100.0*("seqReadsHitMem")/NULLIFZERO("seqStreamReadCount")),4)::float as seq_mem_miss_pct,
+  round(ZEROIFNULL(100.0*("raSkipMaxPending")/NULLIFZERO("seqStreamReadCount")),4)::float as hdd_skip_pct,
+  round(ZEROIFNULL(100.0*("unalignedOffsetOps")/NULLIFZERO("writes"+"reads")),4)::float as unalign_offset_pct,
+  round(ZEROIFNULL(100.0*("unalignedLengthOps")/NULLIFZERO("writes"+"reads")),4)::float as unalign_length_pct,
+  round(ZEROIFNULL(100.0*(("unalignedIoCase1"+"unalignedIoCase3")/NULLIFZERO("reads"+"writes"+"unmapRequestCount"))),4)::float as unalign_fixable_pct,
+  round(ZEROIFNULL(100.0*(("unalignedIoCase2"-"unalignedIoCase1")/NULLIFZERO("reads"+"writes"+"unmapRequestCount"))),4)::float as unalign_maybe_fixable_pct,
+  round(ZEROIFNULL(100.0*(("unalignedIoCase4")/NULLIFZERO("reads"+"writes"+"unmapRequestCount"))),4)::float as unalign_unfixable_pct,
+  round(ZEROIFNULL(100.0*(("unalignedIoCase1")/NULLIFZERO("reads"+"writes"+"unmapRequestCount"))),4)::float as unalign_case1_pct,
+  round(ZEROIFNULL(100.0*(("unalignedIoCase2")/NULLIFZERO("reads"+"writes"+"unmapRequestCount"))),4)::float as unalign_case2_pct,
+  round(ZEROIFNULL(100.0*(("unalignedIoCase3")/NULLIFZERO("reads"+"writes"+"unmapRequestCount"))),4)::float as unalign_case3_pct,
+  round(ZEROIFNULL(100.0*(("unalignedIoCase4")/NULLIFZERO("reads"+"writes"+"unmapRequestCount"))),4)::float as unalign_case4_pct,
+  round(ZEROIFNULL(100.0*(("unalignedIoCase5")/NULLIFZERO("reads"+"writes"+"unmapRequestCount"))),4)::float as unalign_case5_pct,
+  "underlayOps"::float as ulay_sys,
+  "underlayPauses"::float as upause_sys,
+  reads,
+  writes,
+  timeReads,
+  timeWrites,
+  timeReadsQueue,
+  timeWritesQueue,
+  timeReadsFull,
+  timeWritesFull,
+
+  unmapZeroCount,
+  unmapZeroBlocks,
+  unmapWriteSameCount,
+  unmapWriteSameBlocks,
+  unmapRequestCount,
+  unmapRequestBlocks,
+
+  replRxBlocks,
+  replRxDataBytes,
+  replTxBlocks,
+  replTxDataBytes,
+
+  xcopyRequestCount,
+  xcopyBlocksCopied,
+  xcopyRequestTime,
+
+  odxReadRequestCount,
+  odxReadBlocks,
+  odxReadTime,
+  odxReadPartial,
+  odxWriteRequestCount,
+  odxWriteBlocks,
+  odxWriteTime,
+  odxWritePartial,
+
+  dedupeBlockCount,
+  dedupeBurstBlockCount,
+  dedupeZeroCount,
+  dedupeableTotalBlocks,
+  dedupeBurstDdupUesBlockCount,
+  dedupeBurstFiNvpgBlockCount,
+  dedupeBurstFiUbSzBlockCount,
+  dedupeBurstLowFlashBlockCount,
+
+  numIopsLimitThrottleCnt as numIopsLimitThrottleCntSystem,
+  numMbpsLimitThrottleCnt as numMbpsLimitThrottleCntSystem,
+  iopsLimitThrottleCycles as iopsLimitThrottleCyclesSystem,
+  mbpsLimitThrottleCycles as mbpsLimitThrottleCyclesSystem,
+
+  "nsNumReadS0B-512B",
+  "nsNumReadS512B-1k",
+  "nsNumReadS1k-2k",
+  "nsNumReadS2k-4k",
+  "nsNumReadS4k-8k",
+  "nsNumReadS8k-16k",
+  "nsNumReadS16k-32k",
+  "nsNumReadS32k-64k",
+  "nsNumReadS64k-128k",
+  "nsNumReadS128k-256k",
+  "nsNumReadS256k-512k",
+  "nsNumReadS512k-max",
+  "seqNumReadS0B-512B",
+  "seqNumReadS512B-1k",
+  "seqNumReadS1k-2k",
+  "seqNumReadS2k-4k",
+  "seqNumReadS4k-8k",
+  "seqNumReadS8k-16k",
+  "seqNumReadS16k-32k",
+  "seqNumReadS32k-64k",
+  "seqNumReadS64k-128k",
+  "seqNumReadS128k-256k",
+  "seqNumReadS256k-512k",
+  "seqNumReadS512k-max",
+  "numWriteS0B-512B",
+  "numWriteS512B-1k",
+  "numWriteS1k-2k",
+  "numWriteS2k-4k",
+  "numWriteS4k-8k",
+  "numWriteS8k-16k",
+  "numWriteS16k-32k",
+  "numWriteS32k-64k",
+  "numWriteS64k-128k",
+  "numWriteS128k-256k",
+  "numWriteS256k-512k",
+  "numWriteS512k-max",
+  "nsTimeReadS0B-512B",
+  "nsTimeReadS512B-1k",
+  "nsTimeReadS1k-2k",
+  "nsTimeReadS2k-4k",
+  "nsTimeReadS4k-8k",
+  "nsTimeReadS8k-16k",
+  "nsTimeReadS16k-32k",
+  "nsTimeReadS32k-64k",
+  "nsTimeReadS64k-128k",
+  "nsTimeReadS128k-256k",
+  "nsTimeReadS256k-512k",
+  "nsTimeReadS512k-max",
+  "seqTimeReadS0B-512B",
+  "seqTimeReadS512B-1k",
+  "seqTimeReadS1k-2k",
+  "seqTimeReadS2k-4k",
+  "seqTimeReadS4k-8k",
+  "seqTimeReadS8k-16k",
+  "seqTimeReadS16k-32k",
+  "seqTimeReadS32k-64k",
+  "seqTimeReadS64k-128k",
+  "seqTimeReadS128k-256k",
+  "seqTimeReadS256k-512k",
+  "seqTimeReadS512k-max",
+  "timeWriteS0B-512B",
+  "timeWriteS512B-1k",
+  "timeWriteS1k-2k",
+  "timeWriteS2k-4k",
+  "timeWriteS4k-8k",
+  "timeWriteS8k-16k",
+  "timeWriteS16k-32k",
+  "timeWriteS32k-64k",
+  "timeWriteS64k-128k",
+  "timeWriteS128k-256k",
+  "timeWriteS256k-512k",
+  "timeWriteS512k-max",
+   snapReplRxBlocks,
+   snapReplRxDataBytes,
+   snapReplTxBlocks,
+   snapReplTxDataBytes,
+   syncReplRxBlocks,
+   syncReplRxDataBytes,
+   syncReplTxBlocks,
+   syncReplTxDataBytes,
+   syncReplTotalMsec,
+   syncReplTxOps,
+   timeWritesIoReplDownstream,
+   timeWritesIoReplUpstreamNetwork,
+   timeWritesIoReplUpstreamWait
+from
+  sensors0.array_ds_sys_diff s
+  inner join array_lvl_perf_pipeline_scope q on s."Array SN" = q.array_sn
+where
+      "Sensors Local Month" >= date_trunc('month', start_ts)
+  and "Sensors Local Month" <= date_trunc('month', end_ts)
+  and "Sensors Local Week" >= date_trunc('week', start_ts)
+  and "Sensors Local Week" <= date_trunc('week', end_ts)
+  and "Sensors Local Date" >= date_trunc('day', start_ts)
+  and "Sensors Local Date" <= date_trunc('day', end_ts)
+  and "Sensors Local Timestamp" >= start_ts
+  and "Sensors Local Timestamp" < end_ts
+  and "Grain" = 'pm'
+;
+
+select count(*),count(distinct sn),min(ts),max(ts) from dssysdiff;
+select * from dssysdiff limit 10;
+
+
+
+
+
+
+
+-- cte for perf_joined 2
+drop table if exists dsdiagdiff;
+create local temp table dsdiagdiff on commit preserve rows as 
+select
+  "Array SN" as sn,
+  "Array Hostname" as hn,
+  "Sensors Local Date" as day,
+  "Sensors Local Timestamp" as ts,
+  "Sensors Local Epoch" as epo,
+  "dbbSyncUnderlayPauses"::float as upause_diag,
+  "dbbSyncUnderlays"::float as ulay_diag,
+  "dbbWrkrOvgsGetFailUncool"::float as _uncool,
+  round(ZEROIFNULL("cacheBiMiss"/NULLIFZERO("cacheBiHitSsd"+"cacheBiHitMem"+"cacheBiMiss"))*100,4)::float as cache_bi_miss_pct,
+  round(ZEROIFNULL("cacheDiMiss"/NULLIFZERO("cacheDiHitSsd"+"cacheDiHitMem"+"cacheDiMiss"))*100,4)::float as cache_di_miss_pct,
+  round(ZEROIFNULL("cacheFiMiss"/NULLIFZERO("cacheFiHitSsd"+"cacheFiHitMem"+"cacheFiMiss"))*100,4)::float as cache_fi_miss_pct,
+  round(ZEROIFNULL((coalesce("busBiWriteSkipCache",0) + coalesce("busDataWriteSkipCache",0) + coalesce("busDiWriteSkipCache",0) + coalesce("busFiWriteSkipCache",0)) /
+        NULLIFZERO( coalesce("busBiWriteSkipCache",0) + coalesce("busDataWriteSkipCache",0) + coalesce("busDiWriteSkipCache",0) + coalesce("busFiWriteSkipCache",0) + coalesce("busFlashWritesWrite",0)))*100,4)::float as write_skip_cache_pct,
+  round(ZEROIFNULL((coalesce("busBiRmissSkipCache",0) + coalesce("busDataRmissSkipCache",0) + coalesce("busDiRmissSkipCache",0) + coalesce("busFiRmissSkipCache",0) + coalesce("busGenRollRmissSkipCache",0)) /
+        NULLIFZERO( coalesce("busBiRmissSkipCache",0) + coalesce("busDataRmissSkipCache",0) + coalesce("busDiRmissSkipCache",0) + coalesce("busFiRmissSkipCache",0) + coalesce("busGenRollRmissSkipCache",0) + coalesce("busFlashWritesRmiss",0)))*100,4)::float as rmiss_skip_cache_pct,
+  round(ZEROIFNULL((coalesce("busBiRmissSkipCache",0) + coalesce("busDataRmissSkipCache",0) + coalesce("busDiRmissSkipCache",0) + coalesce("busFiRmissSkipCache",0) + coalesce("busGenRollRmissSkipCache",0) +
+                    coalesce("busBiWriteSkipCache",0) + coalesce("busDataWriteSkipCache",0) + coalesce("busDiWriteSkipCache",0) + coalesce("busFiWriteSkipCache",0)) /
+        NULLIFZERO( coalesce("busBiRmissSkipCache",0) + coalesce("busDataRmissSkipCache",0) + coalesce("busDiRmissSkipCache",0) + coalesce("busFiRmissSkipCache",0) + coalesce("busGenRollRmissSkipCache",0) + coalesce("busFlashWritesRmiss",0) +
+                    coalesce("busBiWriteSkipCache",0) + coalesce("busDataWriteSkipCache",0) + coalesce("busDiWriteSkipCache",0) + coalesce("busFiWriteSkipCache",0) + coalesce("busFlashWritesWrite",0)))*100,4)::float as total_skip_cache_pct,
+  ioRedDelayTime,
+  ioRedDelayCount,
+  ioRedDelayMaxed,
+  ioRedCount,
+  ioRedDropCount,
+  ioRedStageCount,
+  vmSetRedSleepTime,
+  iscsiReadRedSleepTime,
+  dGcRedEntry,
+  dGcRedExit,
+  fGcRedEntry,
+  fGcRedExit,
+  dGcBytesReapedRED,
+  dGcNumBlkReapedRED,
+  fGcBytesReapedRED,
+  fGcNumBlkReapedRED,
+  busBiFlashWriteRed,
+  busBiRmissFlashRed,
+  busDataFlashWriteRed,
+  busDataRmissFlashRed,
+  busDiFlashWriteRed,
+  busDiRmissFlashRed,
+  busFiFlashWriteRed,
+  busFiRmissFlashRed,
+  busPinnedDataFlashWriteRed,
+  cacheRedCiCount,
+  cacheRedDataCount,
+  cacheRedDiBiCount,
+
+  writeAdmitThrottleCount,
+  writeAdmitThrottleTime,
+  readAdmitThrottleCount,
+  readAdmitThrottleTime,
+  remoteWriteAdmitThrottleCount,
+  remoteWriteAdmitThrottleTime,
+
+  readAdmitCloseWindowCount,
+  readAdmitForceCloseWindowCount,
+  readAdmitForceOpenWindowCount,
+  readAdmitOpenWindowCount,
+  writeAdmitCloseWindowCount,
+  writeAdmitForceCloseWindowCount,
+  writeAdmitForceOpenWindowCount,
+  writeAdmitOpenWindowCount,
+  remoteWriteAdmitCloseWindowCount,
+  remoteWriteAdmitForceCloseWindowCount,
+  remoteWriteAdmitForceOpenWindowCount,
+  remoteWriteAdmitOpenWindowCount,
+
+  ioThrottleCount,
+  ioThrottleTime,
+
+  cacheMemLeakTagged,
+  cacheMemLeakReachable,
+  cacheMemLeakDetected,
+  cacheMemLeakHighRefCnt,
+  cacheMemLeakFreed,
+  cacheMemLeakWait,
+  cacheMemLeakCheck,
+  cacheMemLeakCheckStarted,
+
+  dbbSyncBytes,
+  cacheDataMiss,
+  dGcNumSegAlloc,
+  txnCommitLatCpu,
+  txnCommitPage,
+  iscsiReadTxqLat,
+  iscsiWriteTxqLat,
+  scsiWriteSubmitTime,
+  cacheFiHitMem,
+  cacheFiMiss,
+  cacheAddFiNode
+
+from
+  sensors0.array_ds_diag_diff s
+  inner join array_lvl_perf_pipeline_scope q on s."Array SN" = q.array_sn
+where
+      "Sensors Local Month" >= date_trunc('month', start_ts)
+  and "Sensors Local Month" <= date_trunc('month', end_ts)
+  and "Sensors Local Week" >= date_trunc('week', start_ts)
+  and "Sensors Local Week" <= date_trunc('week', end_ts)
+  and "Sensors Local Date" >= date_trunc('day', start_ts)
+  and "Sensors Local Date" <= date_trunc('day', end_ts)
+  and "Sensors Local Timestamp" >= start_ts
+  and "Sensors Local Timestamp" < end_ts
+  and "Grain" = 'pm'
+;
+
+select * from dsdiagdiff limit 10;
+select count(*),count(distinct sn),min(ts),max(ts) from dsdiagdiff;
+
+
+
+
+
+
+
+
+--cte for perf_joined 3
+drop table if exists dsdiagspotspot;
+create local temp table dsdiagspotspot on commit preserve rows as
+select
+  "Array SN" as sn,
+  "Array Hostname" as hn,
+  "Sensors Local Date" as day,
+  "Sensors Local Timestamp" as ts,
+  "Sensors Local Epoch" as epo,
+  --flash segments
+  --the below set of calculations is valid for systems running os versions 2.2 or newer
+  fGcSegtype0/NULLIFZERO(fGcSlotTotal) as fUnpinnedData_newFormat,
+  (2*fGcSegtype2)/NULLIFZERO(fGcSlotTotal) as fCi_newFormat,
+  fGcSegtype5/NULLIFZERO(fGcSlotTotal) as fBiDi_newFormat,
+  coalesce(fGcSegtype7,0)/NULLIFZERO(fGcSlotTotal) as fPinnedData_newFormat,
+  (fGcSegtype0+(2*fGcSegtype2)+fGcSegtype5+coalesce(fGcSegtype7,0))/NULLIFZERO(fGcSlotTotal) as fClaimed_newFormat,
+  1-(fGcSegtype0+(2*fGcSegtype2)+fGcSegtype5+coalesce(fGcSegtype7,0))/NULLIFZERO(fGcSlotTotal) as fUnclaimed_newFormat,
+  1-(((2*fGcSegtype2)+fGcSegtype5)/NULLIFZERO(fGcSlotTotal)) as fAvailForData_newFormat,
+  1-(((2*fGcSegtype2)+fGcSegtype5+coalesce(fGcSegtype7,0))/NULLIFZERO(fGcSlotTotal)) as fAvailForUnpinnedData_newFormat,
+  --the below set of calculations is valid for systems running os versions prior to 2.2
+  (fGcSegtype0-fGcSegclean0)/NULLIFZERO(fGcSlotTotal) as fUnpinnedData_oldFormat,
+  (2*(fGcSegtype2-fGcSegclean2))/NULLIFZERO(fGcSlotTotal) as fCi_oldFormat,
+  (fGcSegtype5-fGcSegclean5)/NULLIFZERO(fGcSlotTotal) as fBiDi_oldFormat,
+  0 as fPinnedData_oldFormat, --cache pinning was implemented after the format of these sensors was changed in 2.2 (see above)
+  (fGcSegtype0-fGcSegclean0+(2*(fGcSegtype2-fGcSegclean2))+fGcSegtype5-fGcSegclean5)/NULLIFZERO(fGcSlotTotal) as fClaimed_oldFormat,
+  1-((fGcSegtype0-fGcSegclean0+(2*(fGcSegtype2-fGcSegclean2))+fGcSegtype5-fGcSegclean5)/NULLIFZERO(fGcSlotTotal)) as fUnclaimed_oldFormat,
+  1-(((2*(fGcSegtype2-fGcSegclean2))+fGcSegtype5-fGcSegclean5)/NULLIFZERO(fGcSlotTotal)) as fAvailForData_oldFormat,
+  1-(((2*(fGcSegtype2-fGcSegclean2))+fGcSegtype5-fGcSegclean5)/NULLIFZERO(fGcSlotTotal)) as fAvailForUnpinnedData_oldFormat,
+  --disk segments
+  --the below set of calculations is valid for systems running os versions 2.2 or newer
+  dGcSegtype0/NULLIFZERO(dGcSlotTotal) as dData_newFormat,
+  dGcSegtype1/NULLIFZERO(dGcSlotTotal) as dDisktop_newFormat,
+  dGcSegtype3/NULLIFZERO(dGcSlotTotal) as dDi_newFormat,
+  dGcSegtype4/NULLIFZERO(dGcSlotTotal) as dBi_newFormat,
+  dGcSegtype6/NULLIFZERO(dGcSlotTotal) as dHeatmap_newFormat,
+  dGcSegtype8/NULLIFZERO(dGcSlotTotal) as dFi_newFormat,
+  dGcSegtype9/NULLIFZERO(dGcSlotTotal) as dFd_newFormat,
+     (dGcSegtype0+dGcSegtype1+dGcSegtype3+dGcSegtype4+coalesce(dGcSegtype6,0)+coalesce(dGcSegtype8,0)+coalesce(dGcSegtype9,0))/NULLIFZERO(dGcSlotTotal) as dClaimed_newFormat,
+  1-((dGcSegtype0+dGcSegtype1+dGcSegtype3+dGcSegtype4+coalesce(dGcSegtype6,0)+coalesce(dGcSegtype8,0)+coalesce(dGcSegtype9,0))/NULLIFZERO(dGcSlotTotal)) as dUnclaimed_newFormat,
+--the below set of calculations is valid for systems running os versions prior to 2.2
+  (dGcSegtype0-dGcSegclean0)/NULLIFZERO(dGcSlotTotal) as dData_oldFormat,
+  (dGcSegtype1-dGcSegclean1)/NULLIFZERO(dGcSlotTotal) as dDisktop_oldFormat,
+  (dGcSegtype3-dGcSegclean3)/NULLIFZERO(dGcSlotTotal) as dDi_oldFormat,
+  (dGcSegtype4-dGcSegclean4)/NULLIFZERO(dGcSlotTotal) as dBi_oldFormat,
+  (dGcSegtype6-dGcSegclean6)/NULLIFZERO(dGcSlotTotal) as dHeatmap_oldFormat,
+  (dGcSegtype8-dGcSegclean8)/NULLIFZERO(dGcSlotTotal) as dFi_oldFormat,
+  (dGcSegtype9-dGcSegclean9)/NULLIFZERO(dGcSlotTotal) as dFd_oldFormat,
+     (dGcSegtype0-dGcSegclean0+dGcSegtype1-dGcSegclean1+dGcSegtype3-dGcSegclean3+dGcSegtype4-dGcSegclean4+coalesce(dGcSegtype6-dGcSegclean6,0)+coalesce(dGcSegtype8-dGcSegclean8,0)+coalesce(dGcSegtype9-dGcSegclean9,0))/NULLIFZERO(dGcSlotTotal) as dClaimed_oldFormat,
+  1-((dGcSegtype0-dGcSegclean0+dGcSegtype1-dGcSegclean1+dGcSegtype3-dGcSegclean3+dGcSegtype4-dGcSegclean4+coalesce(dGcSegtype6-dGcSegclean6,0)+coalesce(dGcSegtype8-dGcSegclean8,0)+coalesce(dGcSegtype9-dGcSegclean9,0))/NULLIFZERO(dGcSlotTotal)) as dUnclaimed_oldFormat,
+  redPctGc,
+  redPctFlashGcUe,
+  redPctDiUe,
+  dGcPctLiveLogical,
+  dGcPctLiveDi,
+  ueNumDiDeletions,
+  ueNumDi,
+  uePctDi,
+  vmNumPendingGenDels,
+  pgPctNv
+from
+  sensors0.array_ds_diag_spot_spot s
+  inner join array_lvl_perf_pipeline_scope q on s."Array SN" = q.array_sn
+where
+      "Sensors Local Month" >= date_trunc('month', start_ts)
+  and "Sensors Local Month" <= date_trunc('month', end_ts)
+  and "Sensors Local Week" >= date_trunc('week', start_ts)
+  and "Sensors Local Week" <= date_trunc('week', end_ts)
+  and "Sensors Local Date" >= date_trunc('day', start_ts)
+  and "Sensors Local Date" <= date_trunc('day', end_ts)
+  and "Sensors Local Timestamp" >= start_ts
+  and "Sensors Local Timestamp" < end_ts
+  and "Grain" = 'pm';
+
+
+select * from dsdiagspotspot limit 10;
+select count(*),count(distinct sn),min(ts),max(ts) from dsdiagspotspot;
+
+
+
+
+
+
+
+-- cte for perf_joined 4
+drop table if exists net;
+create local temp table net on commit preserve rows as
+select
+  "Array SN" as sn,
+  "Array Hostname" as hn,
+  "Sensors Local Date" as day,
+  "Sensors Local Timestamp" as ts,
+  "Sensors Local Epoch" as epo,
+  round(ZEROIFNULL(100.0*sum("tcpInErrs")/NULLIFZERO(sum("tcpInSegs"))),6)::float as net_inerr_pct,
+  round(ZEROIFNULL(100.0*sum("tcpRetransSegs")/NULLIFZERO(sum("tcpOutSegs"))),6)::float as net_retrans_pct,
+  sum("tcpInErrs")::float as net_inerr_ct,
+  sum("tcpRetransSegs")::float as net_retrans_ct,
+  sum("tcpOutSegs")::float as net_outseg_ct,
+  sum("tcpInSegs")::float as net_inseg_ct
+from
+  sensors0.ctrlr_sys_netsnmp_diff s
+  inner join array_lvl_perf_pipeline_scope q on s."Array SN" = q.array_sn
+where
+      "Sensors Local Month" >= date_trunc('month', start_ts)
+  and "Sensors Local Month" <= date_trunc('month', end_ts)
+  and "Sensors Local Week" >= date_trunc('week', start_ts)
+  and "Sensors Local Week" <= date_trunc('week', end_ts)
+  and "Sensors Local Date" >= date_trunc('day', start_ts)
+  and "Sensors Local Date" <= date_trunc('day', end_ts)
+  and "Sensors Local Timestamp" >= start_ts
+  and "Sensors Local Timestamp" < end_ts
+  and "Grain" = 'pm'
+  group by "Array SN", "Array Hostname", "Sensors Local Date", "Sensors Local Timestamp", "Sensors Local Epoch"
+;
+
+select * from net limit 10;
+select count(*),count(distinct sn),min(ts),max(ts) from net;
+
+
+
+
+
+
+
+
+
+-- cte of array_lvl_perf_joined (#9);
+drop table if exists cpu;
+create local temp table cpu on commit preserve rows as
+
+select
+  y.sn, y.hn, y.ts, y.epo,
+  max(case when ctl = 'A' then cpu_pct else null end) as cpu_busy_ctrlr_a,
+  max(case when ctl = 'B' then cpu_pct else null end) as cpu_busy_ctrlr_b,
+  max(case when ctl = 'A' then cpu_cores_per_ctrlr else null end) as cores_per_ctrlr_a,
+  max(case when ctl = 'B' then cpu_cores_per_ctrlr else null end) as cores_per_ctrlr_b,
+  max(cpu_pct) as cpu_busy_pct,
+  max(cpu_cores_per_ctrlr) as cpu_cores_per_ctrlr
+from (
+    select
+      x.sn, x.hn, x.ts, x.epo,
+      "Controller Name" as ctl,
+      count(1) AS cpu_cores_per_ctrlr,
+      cast(0.01*round(10000.0*(6000*COUNT(1) - SUM("idle") - SUM("iowait")) /(6000*COUNT(1))) as float) AS cpu_busy_raw_pct,
+      cast(max(0.01*round(10000.0*(6000 - "idle" - "iowait") /(6000))) as float) as max_cpu_busy_raw_pct,
+      cast(
+        case
+          when sum("idle") is null then null
+          when sum("iowait") is null then null
+          when sum("idle"+"iowait"+"irq"+"softirq"+"kernel"+"steal"+"userLowprio"+"user")<1000 then null
+          when 6000*count(1) <= 0 then null
+          when 6000*count(1)-sum("idle")-sum("iowait") <= 0 then 0.0
+          when sum("idle")+sum("iowait") <= 0 then 1.0
+          else
+            0.01*round(10000.0*(6000*count(1)-sum("idle")-sum("iowait"))/(6000*count(1)))
+        end as float) as cpu_pct
+    from (
+        select
+          s."Array SN" as sn,
+          s."Array Hostname" as hn,
+          s."Controller Name",
+          s."CPU Core",
+          s."Sensors Local Timestamp" as ts,
+          s."Sensors Local Epoch" as epo,
+          "idle",
+          "iowait",
+          "irq",
+          "softirq",
+          "kernel",
+          "steal",
+          "userLowprio",
+          "user"
+        from
+          sensors0.ctrlr_sys_cpu_diff s
+          inner join sensors0.ctrlr_sys_proc_spot as p
+          on s."Array SN" = p."Array SN"
+          and s."Controller Name" = p."Controller Name"
+          and s.Grain = p.Grain
+          and s."Sensors Local Timestamp" = p."Sensors Local Timestamp"
+          inner join array_lvl_perf_pipeline_scope q on p."Array SN" = q.array_sn
+        where
+              s."Sensors Local Month" >= date_trunc('month', start_ts)
+          and s."Sensors Local Month" <= date_trunc('month', end_ts)
+          and s."Sensors Local Timestamp" >= start_ts
+          and s."Sensors Local Timestamp" < end_ts
+          and s."Grain" = 'pm'
+          and p."Process Name" = 'dsd'
+      ) x
+    group by
+    x.sn, x.hn, x.ts, x.epo, "Controller Name"
+    ) y
+  group by
+    y.sn, y.hn, y.ts, y.epo
+;
+
+select * from cpu limit 10;
+select count(*),count(distinct sn),min(ts),max(ts) from cpu;
+
+
+
+
+
+
+
+-- cte for perf_joined 12
+drop table if exists dsvoldiff;
+create local temp table dsvoldiff on commit preserve rows as
+SELECT sn,
+       hn,
+       day,
+       ts,
+       epo,
+       COUNT(1) AS volume_count,
+       COUNT(CASE WHEN volume_online THEN 1 ELSE NULL END) AS online_volume_count,
+       COUNT(CASE WHEN volume_caching THEN 1 ELSE NULL END) AS caching_volume_count,
+       COUNT(CASE WHEN volume_aggressively_caching THEN 1 ELSE NULL END) AS aggressively_caching_volume_count,
+       COUNT(CASE WHEN volume_pinned THEN 1 ELSE NULL END) AS pinned_volume_count,
+       COUNT(CASE WHEN volume_deduping THEN 1 ELSE NULL END) AS deduping_volume_count,
+       COUNT(CASE WHEN volume_iops_limit THEN 1 ELSE NULL END) AS iops_limit_volume_count,
+       COUNT(CASE WHEN volume_mbps_limit THEN 1 ELSE NULL END) AS mbps_limit_volume_count,
+       SUM(reads) AS readsVolume,
+       SUM(writes) AS writesVolume,
+       SUM(readBytes) AS readBytesVolume,
+       SUM(writeBytes) AS writeBytesVolume,
+       ROUND(ZEROIFNULL (SUM(CASE WHEN volume_encrypted THEN "reads" ELSE NULL END) / NULLIFZERO (SUM("reads")))*100,4)::FLOAT AS encrypted_reads_pct,
+       ROUND(ZEROIFNULL (SUM(CASE WHEN volume_encrypted THEN "writes" ELSE NULL END) / NULLIFZERO (SUM("reads")))*100,4)::FLOAT AS encrypted_writes_pct,
+       ROUND(ZEROIFNULL (SUM(CASE WHEN volume_encrypted THEN "readBytes" ELSE NULL END) / NULLIFZERO (SUM("readBytes")))*100,4)::FLOAT AS encrypted_readBytes_pct,
+       ROUND(ZEROIFNULL (SUM(CASE WHEN volume_encrypted THEN "writeBytes" ELSE NULL END) / NULLIFZERO (SUM("writeBytes")))*100,4)::FLOAT AS encrypted_writeBytes_pct,
+       ROUND(ZEROIFNULL (SUM(CASE WHEN volume_deduping THEN "reads" ELSE NULL END) / NULLIFZERO (SUM("reads")))*100,4)::FLOAT AS deduping_reads_pct,
+       ROUND(ZEROIFNULL (SUM(CASE WHEN volume_deduping THEN "writes" ELSE NULL END) / NULLIFZERO (SUM("reads")))*100,4)::FLOAT AS deduping_writes_pct,
+       ROUND(ZEROIFNULL (SUM(CASE WHEN volume_deduping THEN "readBytes" ELSE NULL END) / NULLIFZERO (SUM("readBytes")))*100,4)::FLOAT AS deduping_readBytes_pct,
+       ROUND(ZEROIFNULL (SUM(CASE WHEN volume_deduping THEN "writeBytes" ELSE NULL END) / NULLIFZERO (SUM("writeBytes")))*100,4)::FLOAT AS deduping_writeBytes_pct,
+       --read and read misses from volumes with various cache settings
+       ROUND(ZEROIFNULL (SUM(CASE WHEN volume_caching THEN "reads" - "seqStreamReadCount" ELSE NULL END) / NULLIFZERO (SUM("reads" - "seqStreamReadCount")))*100,4)::FLOAT AS ns_read_from_cached_volumes_pct,
+       ROUND(ZEROIFNULL (SUM(CASE WHEN volume_caching THEN "seqStreamReadCount" ELSE NULL END) / NULLIFZERO (SUM("seqStreamReadCount")))*100,4)::FLOAT AS seq_read_from_cached_volumes_pct,
+       ROUND(ZEROIFNULL (SUM(CASE WHEN volume_aggressively_caching THEN "reads" - "seqStreamReadCount" ELSE NULL END) / NULLIFZERO (SUM("reads" - "seqStreamReadCount")))*100,4)::FLOAT AS ns_read_from_aggressively_cached_volumes_pct,
+       ROUND(ZEROIFNULL (SUM(CASE WHEN volume_aggressively_caching THEN "seqStreamReadCount" ELSE NULL END) / NULLIFZERO (SUM("seqStreamReadCount")))*100,4)::FLOAT AS seq_read_from_aggressively_cached_volumes_pct,
+       ROUND(ZEROIFNULL (SUM(CASE WHEN volume_pinned THEN "reads" - "seqStreamReadCount" ELSE NULL END) / NULLIFZERO (SUM("reads" - "seqStreamReadCount")))*100,4)::FLOAT AS ns_read_from_pinned_volumes_pct,
+       ROUND(ZEROIFNULL (SUM(CASE WHEN volume_pinned THEN "seqStreamReadCount" ELSE NULL END) / NULLIFZERO (SUM("seqStreamReadCount")))*100,4)::FLOAT AS seq_read_from_pinned_volumes_pct,
+       ROUND(ZEROIFNULL (SUM(CASE WHEN volume_caching THEN "reads" - "seqStreamReadCount" - "nsReadsHitMem" - "nsReadsHitSsd" ELSE NULL END) / NULLIFZERO (SUM("reads" - "seqStreamReadCount" - "nsReadsHitMem" - "nsReadsHitSsd")))*100,4)::FLOAT AS ns_ssd_miss_from_cached_volumes_pct,
+       ROUND(ZEROIFNULL (SUM(CASE WHEN volume_caching THEN "seqStreamReadCount" - "seqReadsHitMem" - "seqReadsHitSsd" ELSE NULL END) / NULLIFZERO (SUM("seqStreamReadCount" - "seqReadsHitMem" - "seqReadsHitSsd")))*100,4)::FLOAT AS seq_ssd_miss_from_cached_volumes_pct,
+       ROUND(ZEROIFNULL (SUM(CASE WHEN volume_aggressively_caching THEN "reads" - "seqStreamReadCount" - "nsReadsHitMem" - "nsReadsHitSsd" ELSE NULL END) / NULLIFZERO (SUM("reads" - "seqStreamReadCount" - "nsReadsHitMem" - "nsReadsHitSsd")))*100,4)::FLOAT AS ns_ssd_miss_from_aggressively_cached_volumes_pct,
+       ROUND(ZEROIFNULL (SUM(CASE WHEN volume_aggressively_caching THEN "seqStreamReadCount" - "seqReadsHitMem" - "seqReadsHitSsd" ELSE NULL END) / NULLIFZERO (SUM("seqStreamReadCount" - "seqReadsHitMem" - "seqReadsHitSsd")))*100,4)::FLOAT AS seq_ssd_miss_from_aggressively_cached_volumes_pct,
+       ROUND(ZEROIFNULL (SUM(CASE WHEN volume_pinned THEN "reads" - "seqStreamReadCount" - "nsReadsHitMem" - "nsReadsHitSsd" ELSE NULL END) / NULLIFZERO (SUM("reads" - "seqStreamReadCount" - "nsReadsHitMem" - "nsReadsHitSsd")))*100,4)::FLOAT AS ns_ssd_miss_from_pinned_volumes_pct,
+       ROUND(ZEROIFNULL (SUM(CASE WHEN volume_pinned THEN "seqStreamReadCount" - "seqReadsHitMem" - "seqReadsHitSsd" ELSE NULL END) / NULLIFZERO (SUM("seqStreamReadCount" - "seqReadsHitMem" - "seqReadsHitSsd")))*100,4)::FLOAT AS seq_ssd_miss_from_pinned_volumes_pct,
+       ROUND(ZEROIFNULL (SUM(CASE WHEN volume_caching THEN "reads" - "seqStreamReadCount" - "nsReadsHitMem" ELSE NULL END) / NULLIFZERO (SUM("reads" - "seqStreamReadCount" - "nsReadsHitMem" - "nsReadsHitSsd")))*100,4)::FLOAT AS ns_mem_miss_from_cached_volumes_pct,
+       ROUND(ZEROIFNULL (SUM(CASE WHEN volume_caching THEN "seqStreamReadCount" - "seqReadsHitMem" ELSE NULL END) / NULLIFZERO (SUM("seqStreamReadCount" - "seqReadsHitMem" - "seqReadsHitSsd")))*100,4)::FLOAT AS seq_mem_miss_from_cached_volumes_pct,
+       ROUND(ZEROIFNULL (SUM(CASE WHEN volume_aggressively_caching THEN "reads" - "seqStreamReadCount" - "nsReadsHitMem" ELSE NULL END) / NULLIFZERO (SUM("reads" - "seqStreamReadCount" - "nsReadsHitMem" - "nsReadsHitSsd")))*100,4)::FLOAT AS ns_mem_miss_from_aggressively_cached_volumes_pct,
+       ROUND(ZEROIFNULL (SUM(CASE WHEN volume_aggressively_caching THEN "seqStreamReadCount" - "seqReadsHitMem" ELSE NULL END) / NULLIFZERO (SUM("seqStreamReadCount" - "seqReadsHitMem" - "seqReadsHitSsd")))*100,4)::FLOAT AS seq_mem_miss_from_aggressively_cached_volumes_pct,
+       ROUND(ZEROIFNULL (SUM(CASE WHEN volume_pinned THEN "reads" - "seqStreamReadCount" - "nsReadsHitMem" ELSE NULL END) / NULLIFZERO (SUM("reads" - "seqStreamReadCount" - "nsReadsHitMem" - "nsReadsHitSsd")))*100,4)::FLOAT AS ns_mem_miss_from_pinned_volumes_pct,
+       ROUND(ZEROIFNULL (SUM(CASE WHEN volume_pinned THEN "seqStreamReadCount" - "seqReadsHitMem" ELSE NULL END) / NULLIFZERO (SUM("seqStreamReadCount" - "seqReadsHitMem" - "seqReadsHitSsd")))*100,4)::FLOAT AS seq_mem_miss_from_pinned_volumes_pct,
+       ROUND(ZEROIFNULL (SUM(CASE WHEN volume_deduping AND (dedupeBlockCount) / NULLIFZERO (dedupeableTotalBlocks - dedupeBurstBlockCount) <= 0.05 THEN writes ELSE NULL END) / NULLIFZERO (SUM(CASE WHEN volume_deduping THEN writes ELSE NULL END)))*100,4)::FLOAT AS writes_to_deduping_volumes_with_lt_5pct_dedupe_pct,
+       ROUND(ZEROIFNULL (SUM(CASE WHEN volume_deduping AND (dedupeBlockCount) / NULLIFZERO (dedupeableTotalBlocks - dedupeBurstBlockCount) <= 0.02 THEN writes ELSE NULL END) / NULLIFZERO (SUM(CASE WHEN volume_deduping THEN writes ELSE NULL END)))*100,4)::FLOAT AS writes_to_deduping_volumes_with_lt_2pct_dedupe_pct,
+       ROUND(ZEROIFNULL (SUM(CASE WHEN volume_deduping AND (dedupeBlockCount) / NULLIFZERO (dedupeableTotalBlocks - dedupeBurstBlockCount) <= 0.01 THEN writes ELSE NULL END) / NULLIFZERO (SUM(CASE WHEN volume_deduping THEN writes ELSE NULL END)))*100,4)::FLOAT AS writes_to_deduping_volumes_with_lt_1pct_dedupe_pct,
+       ROUND(ZEROIFNULL (SUM(CASE WHEN volume_deduping AND (dedupeBlockCount) / NULLIFZERO (dedupeableTotalBlocks - dedupeBurstBlockCount) = 0.00 THEN writes ELSE NULL END) / NULLIFZERO (SUM(CASE WHEN volume_deduping THEN writes ELSE NULL END)))*100,4)::FLOAT AS writes_to_deduping_volumes_with_0pct_dedupe_pct,
+       --iops limit throttling collected at the volume level
+       SUM(numIopsLimitThrottleCnt) AS numIopsLimitThrottleCntVolume,
+       SUM(numMbpsLimitThrottleCnt) AS numMbpsLimitThrottleCntVolume,
+       SUM(iopsLimitThrottleCycles) AS iopsLimitThrottleCyclesVolume,
+       SUM(mbpsLimitThrottleCycles) AS mbpsLimitThrottleCyclesVolume,
+       SUM(schedCpuReadCycles) AS schedCpuReadCycles,
+       SUM(schedCpuWriteCycles) AS schedCpuWriteCycles,
+       SUM(schedCpuContinueCycles) AS schedCpuContinueCycles,
+       SUM(schedCpuExternalCycles) AS schedCpuExternalCycles,
+       --disable compression on volumes rules
+       COUNT(CASE WHEN "Volume + Snapshot Compression (X)" < 1.01 THEN 1 ELSE NULL END) AS volume_count_1pct_compression,
+       ROUND((SUM(CASE WHEN "Volume + Snapshot Compression (X)" < 1.01 THEN writes ELSE 0 END) / NULLIFZERO(SUM(writes)))*100,4)::FLOAT AS volume_writes_uncompressible_pct,
+       ROUND((SUM(CASE WHEN "Volume + Snapshot Compression (X)" < 1.01 THEN reads ELSE 0 END) / NULLIFZERO(SUM(reads)))*100,4)::FLOAT AS volume_reads_uncompressible_pct,
+       ROUND((SUM(CASE WHEN "Volume + Snapshot Compression (X)" < 1.01 THEN "Volume Used (MB)" ELSE 0 END) / NULLIFZERO(SUM("Volume Used (MB)")))*100,4)::FLOAT AS volume_usage_uncompressible_pct,
+       --volume blocksize upping rules
+       ROUND((SUM(CASE WHEN unalignedIoCase3 /NULLIFZERO(reads + writes + unmapRequestCount) >= 0.05  THEN reads + writes else 0 end) / NULLIFZERO(SUM(reads + writes)))*100,4)::FLOAT AS volume_io_with_5pct_unaligment_pct,
+       ROUND((SUM(CASE WHEN unalignedIoCase3 /NULLIFZERO(reads + writes + unmapRequestCount) >= 0.10  THEN reads + writes else 0 end) / NULLIFZERO(SUM(reads + writes)))*100,4)::FLOAT AS volume_io_with_10pct_unaligment_pct,
+       ROUND((SUM(CASE WHEN unalignedIoCase3 /NULLIFZERO(reads + writes + unmapRequestCount) >= 0.20  THEN reads + writes else 0 end) / NULLIFZERO(SUM(reads + writes)))*100,4)::FLOAT  AS volume_io_with_20pct_unaligment_pct,
+       ROUND((SUM(CASE WHEN unalignedIoCase3 /NULLIFZERO(reads + writes + unmapRequestCount) >= 0.50  THEN reads + writes else 0 end) / NULLIFZERO(SUM(reads + writes)))*100,4)::FLOAT  AS volume_io_with_50pct_unaligment_pct,
+       ROUND((SUM(CASE WHEN unalignedIoCase3 /NULLIFZERO(reads + writes + unmapRequestCount) >= 0.80  THEN reads + writes else 0 end) / NULLIFZERO(SUM(reads + writes)))*100,4)::FLOAT  AS volume_io_with_80pct_unaligment_pct,
+       ROUND((SUM(CASE WHEN unalignedIoCase3 /NULLIFZERO(reads + writes + unmapRequestCount) >= 0.90  THEN reads + writes else 0 end) / NULLIFZERO(SUM(reads + writes)))*100,4)::FLOAT  AS volume_io_with_90pct_unaligment_pct,
+       ROUND((SUM(CASE WHEN unalignedIoCase3 /NULLIFZERO(reads + writes + unmapRequestCount) >= 0.95  THEN reads + writes else 0 end) / NULLIFZERO(SUM(reads + writes)))*100,4)::FLOAT  AS volume_io_with_95pct_unaligment_pct
+FROM (SELECT s."Array SN" AS sn,
+             s."Array Hostname" AS hn,
+             s."Volume Stat SN" AS vol_sn,
+             s."Sensors Local Date" AS DAY,
+             s."Sensors Local Timestamp" AS ts,
+             s."Sensors Local Epoch" AS epo,
+             c."ASUP Local Date" AS config_info_day,
+             c."Volume Name" AS volume_name,
+             c."Volume Pinned" AS volume_pinned,
+             (LEFT ("PerfPolicy CachePolicy",10) = 'aggressive' AND "PerfPolicy Caching") OR "Volume Pinned" AS volume_aggressively_caching,
+             ("PerfPolicy CachePolicy" != 'disabled' AND "PerfPolicy Caching") OR "Volume Pinned" AS volume_caching,
+             "Volume Dedupe Enabled" AS volume_deduping,
+             "Volume Encrypted" AS volume_encrypted,
+             "Volume Online" AS volume_online,
+             CASE
+               WHEN "Volume IOPS Limit" > -1 THEN TRUE
+               ELSE FALSE
+             END AS volume_iops_limit,
+             CASE
+               WHEN "Volume MBPS Limit" > -1 THEN TRUE
+               ELSE FALSE
+             END AS volume_mbps_limit,
+             "Volume + Snapshot Compression (X)",
+             "Volume Used (MB)",
+             reads,
+             writes,
+             readBytes,
+             writeBytes,
+             nsReadsHitMem,
+             nsReadsHitSsd,
+             seqReadsHitSsd,
+             seqReadsHitMem,
+             seqStreamReadCount,
+             dedupeBlockCount,
+             dedupeBurstBlockCount,
+             dedupeableTotalBlocks,
+             numIopsLimitThrottleCnt,
+             numMbpsLimitThrottleCnt,
+             iopsLimitThrottleCycles,
+             mbpsLimitThrottleCycles,
+             schedCpuReadCycles,
+             schedCpuWriteCycles,
+             schedCpuContinueCycles,
+             schedCpuExternalCycles,
+             unalignedIoCase3,
+             unmapRequestCount
+      FROM sensors0.array_ds_vol_diff s
+        INNER JOIN array_lvl_perf_pipeline_scope q ON s."Array SN" = q.array_sn
+        INNER JOIN cube0.volumes_shards_current c
+                ON s."Array SN" = c."Array SN"
+               AND s."Volume Stat SN" = c."Volume Stat SN"
+      WHERE "Sensors Local Month" >= date_trunc('month',start_ts)
+      AND   "Sensors Local Month" <= date_trunc('month',end_ts)
+      AND   "Sensors Local Week" >= date_trunc('week',start_ts)
+      AND   "Sensors Local Week" <= date_trunc('week',end_ts)
+      AND   "Sensors Local Date" >= date_trunc('day',start_ts)
+      AND   "Sensors Local Date" <= date_trunc('day',end_ts)
+      AND   "Sensors Local Timestamp" >= start_ts
+      AND   "Sensors Local Timestamp" < end_ts
+      AND   "Grain" = 'pm'
+) dsvoldiff group by sn, hn, day, ts, epo
+;
+select * from dsvoldiff limit 10;
+select count(*),count(distinct sn),min(ts),max(ts) from dsvoldiff;
+
+
+
+
+
+
+-- cte of array_lvl_perf_joined (#16);
+drop table if exists statusevents;
+create local temp table statusevents on commit preserve rows as
+  select coalesce(x.sn, y.sn, z.sn, a.sn) as sn, coalesce(x.ts, y.ts, z.ts, a.ts) as ts, "partner_out_of_sync_11031", "partner_in_sync_11032", "some_volcoll_out_of_sync_11033", "volcoll_in_sync_11034"
+from
+(SELECT distinct "Array SN" as sn,
+        DATE_TRUNC('min', to_timestamp(timestamp)) as ts,
+        TRUE as 'partner_out_of_sync_11031'
+        from status0.events s INNER JOIN array_lvl_perf_pipeline_scope q on s."Array SN" = q.array_sn
+        where type = '11031'
+        and "ASUP Local Timestamp" >= start_ts::date - 7
+        and "ASUP Local Timestamp" <= end_ts::date + 2
+group by "Array SN", to_timestamp(timestamp)) x
+full outer join (
+(SELECT distinct "Array SN" as sn,
+        DATE_TRUNC('min', to_timestamp(timestamp)) as ts,
+        TRUE as 'partner_in_sync_11032'
+        from status0.events s INNER JOIN array_lvl_perf_pipeline_scope q on s."Array SN" = q.array_sn
+        where type = '11032'
+        and "ASUP Local Timestamp" >= start_ts::date - 7
+        and "ASUP Local Timestamp" <= end_ts::date + 2
+group by "Array SN", to_timestamp(timestamp))
+) y on x.sn = y.sn and x.ts = y.ts
+
+full outer join (
+(SELECT distinct "Array SN" as sn,
+        DATE_TRUNC('min', to_timestamp(timestamp)) as ts,
+        TRUE as 'some_volcoll_out_of_sync_11033'
+        from status0.events s INNER JOIN array_lvl_perf_pipeline_scope q on s."Array SN" = q.array_sn
+        where type = '11033'
+        and "ASUP Local Timestamp" >= start_ts::date - 7
+        and "ASUP Local Timestamp" <= end_ts::date + 2
+group by "Array SN", to_timestamp(timestamp))
+) z on (x.sn = z.sn and x.ts = z.ts) or (y.sn = z.sn and y.ts = z.ts)
+
+full outer join (
+(SELECT distinct "Array SN" as sn,
+        DATE_TRUNC('min', to_timestamp(timestamp)) as ts,
+        TRUE as 'volcoll_in_sync_11034'
+        from status0.events s INNER JOIN array_lvl_perf_pipeline_scope q on s."Array SN" = q.array_sn
+        where type = '11034'
+        and "ASUP Local Timestamp" >= start_ts::date - 7
+        and "ASUP Local Timestamp" <= end_ts::date + 2
+group by "Array SN", to_timestamp(timestamp))
+) a 
+on (x.sn = a.sn and x.ts = a.ts) or (y.sn = a.sn and y.ts = a.ts) or (z.sn = a.sn and z.ts = a.ts)
+;
+select * from statusevents limit 10;
+
+
+
+
+
+
+
+
+
+
+-- cte for perf_joined 10
+drop table if exists nic;
+create local temp table nic on commit preserve rows as
+
+select
+  "Array SN" as sn,
+  "Array Hostname" as hn,
+  "Sensors Local Date" as day,
+  "Sensors Local Timestamp" as ts,
+  "Sensors Local Epoch" as epo,
+  round(ZEROIFNULL(100*sum(rxCrcErrs)/NULLIFZERO(sum(rxBytes))),2)::float as rx_crc_error_pct
+from
+  sensors0.ctrlr_sys_nic_diff s
+  inner join array_lvl_perf_pipeline_scope q on s."Array SN" = q.array_sn
+where
+      "Sensors Local Month" >= date_trunc('month', start_ts)
+  and "Sensors Local Month" <= date_trunc('month', end_ts)
+  and "Sensors Local Week" >= date_trunc('week', start_ts)
+  and "Sensors Local Week" <= date_trunc('week', end_ts)
+  and "Sensors Local Date" >= date_trunc('day', start_ts)
+  and "Sensors Local Date" <= date_trunc('day', end_ts)
+  and "Sensors Local Timestamp" >= start_ts
+  and "Sensors Local Timestamp" < end_ts
+  and "Grain" = 'pm'
+  and "NIC Name" = 'extaggr' --since the os already aggregates nic information to the controller level - we only have to take that last step aggregating the controller level stats to the array level
+  group by "Array SN", "Array Hostname", "Sensors Local Date", "Sensors Local Timestamp", "Sensors Local Epoch"
+;
+
+
+
+
+
+
+
+
+
+
+
+
+
+-- cte for perf_joined 11
+drop table if exists dsfolderdiff;
+create local temp table dsfolderdiff on commit preserve rows as
+
+select
+  "Array SN" as sn,
+  "Array Hostname" as hn,
+  "Sensors Local Date" as day,
+  "Sensors Local Timestamp" as ts,
+  "Sensors Local Epoch" as epo,
+  sum(numIopsLimitThrottleCnt) as numIopsLimitThrottleCntFolder,
+  sum(numMbpsLimitThrottleCnt) as numMbpsLimitThrottleCntFolder,
+  sum(iopsLimitThrottleCycles) as iopsLimitThrottleCyclesFolder,
+  sum(mbpsLimitThrottleCycles) as mbpsLimitThrottleCyclesFolder
+from
+  sensors0.array_ds_folder_diff s
+  inner join array_lvl_perf_pipeline_scope q on s."Array SN" = q.array_sn
+where
+      "Sensors Local Month" >= date_trunc('month', start_ts)
+  and "Sensors Local Month" <= date_trunc('month', end_ts)
+  and "Sensors Local Week" >= date_trunc('week', start_ts)
+  and "Sensors Local Week" <= date_trunc('week', end_ts)
+  and "Sensors Local Date" >= date_trunc('day', start_ts)
+  and "Sensors Local Date" <= date_trunc('day', end_ts)
+  and "Sensors Local Timestamp" >= start_ts
+  and "Sensors Local Timestamp" < end_ts
+  and "Grain" = 'pm'
+  group by "Array SN", "Array Hostname", "Sensors Local Date", "Sensors Local Timestamp", "Sensors Local Epoch"
+;
+
+
+
+
+
+
+
+
+
+
+
+
+-- cte for perf_joined 13
+drop table if exists dsdiagspot;
+create local temp table dsdiagspot on commit preserve rows as
+
+select
+  "Array SN" as sn,
+  "Array Hostname" as hn,
+  "Sensors Local Date" as day,
+  "Sensors Local Timestamp" as ts,
+  "Sensors Local Epoch" as epo,
+   vmSrepResyncDataRxBytes,
+   vmSrepResyncDataTxBytes,
+   vmSrepResyncDataTxOpFailures,
+   vmSrepResyncDataTxOpRetries
+from
+  sensors0.array_ds_diag_spot s
+  inner join array_lvl_perf_pipeline_scope q on s."Array SN" = q.array_sn
+where
+      "Sensors Local Month" >= date_trunc('month', start_ts)
+  and "Sensors Local Month" <= date_trunc('month', end_ts)
+  and "Sensors Local Week" >= date_trunc('week', start_ts)
+  and "Sensors Local Week" <= date_trunc('week', end_ts)
+  and "Sensors Local Date" >= date_trunc('day', start_ts)
+  and "Sensors Local Date" <= date_trunc('day', end_ts)
+  and "Sensors Local Timestamp" >= start_ts
+  and "Sensors Local Timestamp" < end_ts
+  and "Grain" = 'pm'
+;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+-- cte for perf_joined 14
+drop table if exists dsatmdiff;
+create local temp table dsatmdiff on commit preserve rows as
+
+select
+  "Array SN" as sn,
+  "Array Hostname" as hn,
+  "Sensors Local Date" as day,
+  "Sensors Local Timestamp" as ts,
+  "Sensors Local Epoch" as epo,
+   atmItdCpuSaturatedCnt
+from
+  sensors0.array_ds_atm_diff s
+  inner join array_lvl_perf_pipeline_scope q on s."Array SN" = q.array_sn
+where
+      "Sensors Local Month" >= date_trunc('month', start_ts)
+  and "Sensors Local Month" <= date_trunc('month', end_ts)
+  and "Sensors Local Week" >= date_trunc('week', start_ts)
+  and "Sensors Local Week" <= date_trunc('week', end_ts)
+  and "Sensors Local Date" >= date_trunc('day', start_ts)
+  and "Sensors Local Date" <= date_trunc('day', end_ts)
+  and "Sensors Local Timestamp" >= start_ts
+  and "Sensors Local Timestamp" < end_ts
+  and "Grain" = 'pm'
+;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+-- cte for perf_joined 15
+drop table if exists fisize;
+create local temp table fisize on commit preserve rows as
+
+SELECT asn as sn,
+       slice_time as ts,
+       ts_FIRST_VALUE(FI_size_GB) AS fi_size_gb
+FROM (SELECT asn,
+             DATE_TRUNC('min',ets) AS ts,
+             (16 *MAX(NVL (REGEXP_SUBSTR (txt,'n_l0_blk_added:\s+(\d+)',1,1,'i',1)::INT,0)) +MAX(NVL (REGEXP_SUBSTR (txt,'n_ln_blk_added:\s+(\d+)',1,1,'i',1)::INT,0))*8) / 1024 ^ 2 AS FI_size_GB
+      FROM events0.log s
+        INNER JOIN array_lvl_perf_pipeline_scope q on s.asn = q.array_sn
+      WHERE typ = 'dsd'
+      AND   thr = 'bus'
+      AND   fun = 'f_DDSYNC_sync_end'
+      AND   (txt LIKE '%n_ln_blk_added:%' OR txt LIKE '%n_l0_blk_added:%')
+      AND   ets >= start_ts::date - 2
+      AND   ets <= end_ts::date + 2
+      GROUP BY asn,
+               ts
+      ORDER BY ts) x TIMESERIES slice_time AS '1 min' OVER (PARTITION BY asn ORDER BY ts)
+;
+
+
+
+
+
+
+
+
+
+
+
+-- cte for perf_joined 17
+drop table if exists config;
+create local temp table config on commit preserve rows as
+select
+  "Array SN" as sn,
+  "Array Hostname" as hn,
+  "ASUP Local Date" as config_info_day,
+  "Array Model" as raw_model,
+  map_raw_model_to_array_type("Array Model") as array_type,
+  map_raw_model_to_array_series("Array Model") as array_series,
+  map_raw_model_to_cpu_speed("Array Model") as cpu_speed, -- in MHz
+  "Array SW Version" as os_version
+  -- case
+  -- when coalesce("Array Usage Valid",true) is false then null
+  -- when (100*"Array Capacity Used (B)")/NULLIFZERO("Array Capacity (B)") > 100 then null
+  -- when (100*"Array Capacity Used (B)")/NULLIFZERO("Array Capacity (B)") < 0 then null
+  -- else (100*"Array Capacity Used (B)")/NULLIFZERO("Array Capacity (B)") end as user_capacity_usage_pct
+from
+  cube0.arrays_current c
+  inner join array_lvl_perf_pipeline_scope q on c."Array SN" = q.array_sn
+;
+
+
+
+
+
+
+
+
+drop table if exists array_lvl_perf_joined;
+create local temp table array_lvl_perf_joined on commit preserve rows as select
+  dssysdiff.sn as array_sn,
+  dssysdiff.hn as array_hn,
+  dssysdiff.day,
+  dssysdiff.ts,
+  dssysdiff.epo,
+  raw_model,
+  array_type,
+  array_series,
+  os_version,
+  --user_capacity_usage_pct,
+  config_info_day,
+  rrops,
+  rrmbps,
+  rwops,
+  rwmbps,
+  srops,
+  srmbps,
+  swops,
+  swmbps,
+  kbpr,
+  kbpw,
+  (rrops + rwops + srops + swops) as iops,
+  (100*rrops)/NULLIFZERO(rrops + rwops + srops + swops) as ns_read_ops_pct,
+  (100*srops)/NULLIFZERO(rrops + rwops + srops + swops) as seq_read_ops_pct,
+  (100*rwops)/NULLIFZERO(rrops + rwops + srops + swops) as ns_write_ops_pct,
+  (100*swops)/NULLIFZERO(rrops + rwops + srops + swops) as seq_write_ops_pct,
+  (rrmbps + rwmbps + srmbps + swmbps) as mbps,
+  (100*rrmbps)/NULLIFZERO(rrmbps + rwmbps + srmbps + swmbps) as ns_read_mbps_pct,
+  (100*srmbps)/NULLIFZERO(rrmbps + rwmbps + srmbps + swmbps) as seq_read_mbps_pct,
+  (100*rwmbps)/NULLIFZERO(rrmbps + rwmbps + srmbps + swmbps) as ns_write_mbps_pct,
+  (100*swmbps)/NULLIFZERO(rrmbps + rwmbps + srmbps + swmbps) as seq_write_mbps_pct,
+  round(ZEROIFNULL((0.001*"timeReadsFull")/NULLIFZERO("reads")),3)::float as full_rlat_ms, --full read latency in milliseconds
+  round(ZEROIFNULL((0.001*"timeWritesFull")/NULLIFZERO("writes")),3)::float as full_wlat_ms, --full write latency in milliseconds
+  round(ZEROIFNULL((100*coalesce("iscsiReadRedSleepTime",0))/NULLIFZERO(0.001*"timeReadsFull")),3)::float as red_rlat_pct, --note that the units on iscsiReadRedSleepTime is ms while timeReadsFull is µs
+  round(ZEROIFNULL((100*coalesce("vmSetRedSleepTime","ioRedDelayTime",0))/NULLIFZERO(0.001*"timeWritesFull")),3)::float as red_wlat_pct,  --note that the units on ioRedDelayTime is ms while timeReadsFull is µs
+  round(ZEROIFNULL((100*"timeReads")/NULLIFZERO("timeReadsFull")),3)::float as ds_rlat_pct,
+  round(ZEROIFNULL((100*"timeWrites")/NULLIFZERO("timeWritesFull")),3)::float as ds_wlat_pct,
+  round((100*"timeReadsQueue")/NULLIFZERO("timeReadsFull"),3)::float as queue_rlat_pct,
+  round((100*"timeWritesQueue")/NULLIFZERO("timeWritesFull"),3)::float as queue_wlat_pct,
+  round((100*"readAdmitThrottleTime")/NULLIFZERO("timeReadsFull"),3)::float as internal_qos_rlat_pct, --readAdmitThrottle time has units of µs
+  round((100*"writeAdmitThrottleTime")/NULLIFZERO("timeWritesFull"),3)::float as internal_qos_wlat_pct, --writeAdmitThrottleTime has units of µs
+  (100*ioRedDelayCount)/(NULLIFZERO(rrops + rwops + srops + swops)*60) as io_red_delay_pct,
+  (100*ioRedCount)/(NULLIFZERO(rrops + rwops + srops + swops)*60) as io_red_pct,
+  round((timeWritesIoReplDownstream/NULLIFZERO(timeWrites))*100,3)::float as sync_repl_downstream_ds_wlat_pct,
+  round((timeWritesIoReplUpstreamNetwork/NULLIFZERO(timeWrites))*100.0,3)::float as sync_repl_upstream_network_ds_wlat_pct,
+  round((timeWritesIoReplUpstreamWait/NULLIFZERO(timeWrites))*100.0,3)::float as sync_repl_upstream_wait_ds_wlat_pct,
+  round((timeWritesIoReplDownstream/NULLIFZERO(timeWritesFull))*100.0,3)::float as sync_repl_downstream_wlat_pct,
+  round((timeWritesIoReplUpstreamNetwork/NULLIFZERO(timeWritesFull))*100.0,3)::float as sync_repl_upstream_network_wlat_pct,
+  round((timeWritesIoReplUpstreamWait/NULLIFZERO(timeWritesFull))*100.0,3)::float as sync_repl_upstream_wait_wlat_pct,
+
+  ioRedDelayTime,
+  ioRedDelayCount,
+  ioRedDelayMaxed,
+  ioRedCount,
+  ioRedDropCount,
+  ioRedStageCount,
+
+  cpu_busy_pct,
+
+  NULLIFZERO(case when "schedCpuCycleMax" > 0 then round(100*(
+  (
+  coalesce(schedCpuCycleAutogen   ,0)+
+  coalesce(schedCpuCycleBgJobs    ,0)+
+  coalesce(schedCpuCycleBinMig    ,0)+
+  coalesce(schedCpuCycleCISync    ,0)+
+  coalesce(schedCpuCycleCkpt      ,0)+
+  coalesce(schedCpuCycleCpOffload ,0)+
+  coalesce(schedCpuCycleDGc       ,0)+
+  coalesce(schedCpuCycleDISync    ,0)+
+  coalesce(schedCpuCycleDbbSync   ,0)+
+  coalesce(schedCpuCycleDel       ,0)+
+  coalesce(schedCpuCycleDsdm      ,0)+
+  coalesce(schedCpuCycleFGc       ,0)+
+  coalesce(schedCpuCycleFISync    ,0)+
+  coalesce(schedCpuCycleFgHiPrio  ,0)+
+  coalesce(schedCpuCycleFgIo      ,0)+
+  coalesce(schedCpuCycleGc        ,0)+
+  coalesce(schedCpuCycleHiPrio    ,0)+
+  coalesce(schedCpuCycleIdle      ,0)+
+  coalesce(schedCpuCycleIo        ,0)+
+  coalesce(schedCpuCycleMirror    ,0)+
+  coalesce(schedCpuCycleMisc      ,0)+
+  coalesce(schedCpuCyclePin       ,0)+
+  coalesce(schedCpuCycleRaidResync,0)+
+  coalesce(schedCpuCycleRepl      ,0)+
+  coalesce(schedCpuCycleSysHiPrio ,0)+
+  coalesce(schedCpuCycleDISyncBlack,0)+
+  coalesce(schedCpuCycleDISyncWhite,0)+
+  coalesce(schedCpuCycleSyncRep,0)) /"schedCpuCycleMax"),4.0) else round(100*(
+  (coalesce(schedCpuCycleAutogen   ,0)+
+  coalesce(schedCpuCycleBgJobs    ,0)+
+  coalesce(schedCpuCycleBinMig    ,0)+
+  coalesce(schedCpuCycleCISync    ,0)+
+  coalesce(schedCpuCycleCkpt      ,0)+
+  coalesce(schedCpuCycleCpOffload ,0)+
+  coalesce(schedCpuCycleDGc       ,0)+
+  coalesce(schedCpuCycleDISync    ,0)+
+  coalesce(schedCpuCycleDbbSync   ,0)+
+  coalesce(schedCpuCycleDel       ,0)+
+  coalesce(schedCpuCycleDsdm      ,0)+
+  coalesce(schedCpuCycleFGc       ,0)+
+  coalesce(schedCpuCycleFISync    ,0)+
+  coalesce(schedCpuCycleFgHiPrio  ,0)+
+  coalesce(schedCpuCycleFgIo      ,0)+
+  coalesce(schedCpuCycleGc        ,0)+
+  coalesce(schedCpuCycleHiPrio    ,0)+
+  coalesce(schedCpuCycleIdle      ,0)+
+  coalesce(schedCpuCycleIo        ,0)+
+  coalesce(schedCpuCycleMirror    ,0)+
+  coalesce(schedCpuCycleMisc      ,0)+
+  coalesce(schedCpuCyclePin       ,0)+
+  coalesce(schedCpuCycleRaidResync,0)+
+  coalesce(schedCpuCycleRepl      ,0)+
+  coalesce(schedCpuCycleSysHiPrio ,0)+
+  coalesce(schedCpuCycleDISyncBlack,0)+
+  coalesce(schedCpuCycleDISyncWhite,0)+
+  coalesce(schedCpuCycleSyncRep,0)) /(60*1000000*cpu_speed*cpu_cores_per_ctrlr)),4.0) end) as total_alloc_cpu_busy_pct,
+
+  ZEROIFNULL(case when "schedCpuCycleMax" > 0 then round(100*(schedCpuCycleAutogen    /"schedCpuCycleMax"),4.0) else round(100*schedCpuCycleAutogen    /NULLIFZERO(60*1000000*cpu_speed*cpu_cores_per_ctrlr),4.0) end) as cpu_pct_Autogen,
+  ZEROIFNULL(case when "schedCpuCycleMax" > 0 then round(100*(schedCpuCycleBgJobs     /"schedCpuCycleMax"),4.0) else round(100*schedCpuCycleBgJobs     /NULLIFZERO(60*1000000*cpu_speed*cpu_cores_per_ctrlr),4.0) end) as cpu_pct_BgJobs,
+  ZEROIFNULL(case when "schedCpuCycleMax" > 0 then round(100*(schedCpuCycleBinMig     /"schedCpuCycleMax"),4.0) else round(100*schedCpuCycleBinMig     /NULLIFZERO(60*1000000*cpu_speed*cpu_cores_per_ctrlr),4.0) end) as cpu_pct_BinMig,
+  ZEROIFNULL(case when "schedCpuCycleMax" > 0 then round(100*(schedCpuCycleCISync     /"schedCpuCycleMax"),4.0) else round(100*schedCpuCycleCISync     /NULLIFZERO(60*1000000*cpu_speed*cpu_cores_per_ctrlr),4.0) end) as cpu_pct_CISync,
+  ZEROIFNULL(case when "schedCpuCycleMax" > 0 then round(100*(schedCpuCycleCkpt       /"schedCpuCycleMax"),4.0) else round(100*schedCpuCycleCkpt       /NULLIFZERO(60*1000000*cpu_speed*cpu_cores_per_ctrlr),4.0) end) as cpu_pct_Ckpt,
+  ZEROIFNULL(case when "schedCpuCycleMax" > 0 then round(100*(schedCpuCycleCpOffload  /"schedCpuCycleMax"),4.0) else round(100*schedCpuCycleCpOffload  /NULLIFZERO(60*1000000*cpu_speed*cpu_cores_per_ctrlr),4.0) end) as cpu_pct_CpOffload,
+  ZEROIFNULL(case when "schedCpuCycleMax" > 0 then round(100*(schedCpuCycleDGc        /"schedCpuCycleMax"),4.0) else round(100*schedCpuCycleDGc        /NULLIFZERO(60*1000000*cpu_speed*cpu_cores_per_ctrlr),4.0) end) as cpu_pct_DGc,
+  ZEROIFNULL(case when "schedCpuCycleMax" > 0 then round(100*(schedCpuCycleDISync     /"schedCpuCycleMax"),4.0) else round(100*schedCpuCycleDISync     /NULLIFZERO(60*1000000*cpu_speed*cpu_cores_per_ctrlr),4.0) end) as cpu_pct_DISync,
+  ZEROIFNULL(case when "schedCpuCycleMax" > 0 then round(100*(schedCpuCycleDbbSync    /"schedCpuCycleMax"),4.0) else round(100*schedCpuCycleDbbSync    /NULLIFZERO(60*1000000*cpu_speed*cpu_cores_per_ctrlr),4.0) end) as cpu_pct_DbbSync,
+  ZEROIFNULL(case when "schedCpuCycleMax" > 0 then round(100*(schedCpuCycleDel        /"schedCpuCycleMax"),4.0) else round(100*schedCpuCycleDel        /NULLIFZERO(60*1000000*cpu_speed*cpu_cores_per_ctrlr),4.0) end) as cpu_pct_Del,
+  ZEROIFNULL(case when "schedCpuCycleMax" > 0 then round(100*(schedCpuCycleDsdm       /"schedCpuCycleMax"),4.0) else round(100*schedCpuCycleDsdm       /NULLIFZERO(60*1000000*cpu_speed*cpu_cores_per_ctrlr),4.0) end) as cpu_pct_Dsdm,
+  ZEROIFNULL(case when "schedCpuCycleMax" > 0 then round(100*(schedCpuCycleFGc        /"schedCpuCycleMax"),4.0) else round(100*schedCpuCycleFGc        /NULLIFZERO(60*1000000*cpu_speed*cpu_cores_per_ctrlr),4.0) end) as cpu_pct_FGc,
+  ZEROIFNULL(case when "schedCpuCycleMax" > 0 then round(100*(schedCpuCycleFISync     /"schedCpuCycleMax"),4.0) else round(100*schedCpuCycleFISync     /NULLIFZERO(60*1000000*cpu_speed*cpu_cores_per_ctrlr),4.0) end) as cpu_pct_FISync,
+  ZEROIFNULL(case when "schedCpuCycleMax" > 0 then round(100*(schedCpuCycleFgHiPrio   /"schedCpuCycleMax"),4.0) else round(100*schedCpuCycleFgHiPrio   /NULLIFZERO(60*1000000*cpu_speed*cpu_cores_per_ctrlr),4.0) end) as cpu_pct_FgHiPrio,
+  ZEROIFNULL(case when "schedCpuCycleMax" > 0 then round(100*(schedCpuCycleFgIo       /"schedCpuCycleMax"),4.0) else round(100*schedCpuCycleFgIo       /NULLIFZERO(60*1000000*cpu_speed*cpu_cores_per_ctrlr),4.0) end) as cpu_pct_FgIo,
+  ZEROIFNULL(case when "schedCpuCycleMax" > 0 then round(100*(schedCpuCycleGc         /"schedCpuCycleMax"),4.0) else round(100*schedCpuCycleGc         /NULLIFZERO(60*1000000*cpu_speed*cpu_cores_per_ctrlr),4.0) end) as cpu_pct_Gc,
+  ZEROIFNULL(case when "schedCpuCycleMax" > 0 then round(100*(schedCpuCycleHiPrio     /"schedCpuCycleMax"),4.0) else round(100*schedCpuCycleHiPrio     /NULLIFZERO(60*1000000*cpu_speed*cpu_cores_per_ctrlr),4.0) end) as cpu_pct_HiPrio,
+  ZEROIFNULL(case when "schedCpuCycleMax" > 0 then round(100*(schedCpuCycleIdle       /"schedCpuCycleMax"),4.0) else round(100*schedCpuCycleIdle       /NULLIFZERO(60*1000000*cpu_speed*cpu_cores_per_ctrlr),4.0) end) as cpu_pct_Idle,
+  ZEROIFNULL(case when "schedCpuCycleMax" > 0 then round(100*(schedCpuCycleIo         /"schedCpuCycleMax"),4.0) else round(100*schedCpuCycleIo         /NULLIFZERO(60*1000000*cpu_speed*cpu_cores_per_ctrlr),4.0) end) as cpu_pct_Io,
+  ZEROIFNULL(case when "schedCpuCycleMax" > 0 then round(100*(schedCpuCycleMirror     /"schedCpuCycleMax"),4.0) else round(100*schedCpuCycleMirror     /NULLIFZERO(60*1000000*cpu_speed*cpu_cores_per_ctrlr),4.0) end) as cpu_pct_Mirror,
+  ZEROIFNULL(case when "schedCpuCycleMax" > 0 then round(100*(schedCpuCycleMisc       /"schedCpuCycleMax"),4.0) else round(100*schedCpuCycleMisc       /NULLIFZERO(60*1000000*cpu_speed*cpu_cores_per_ctrlr),4.0) end) as cpu_pct_Misc,
+  ZEROIFNULL(case when "schedCpuCycleMax" > 0 then round(100*(schedCpuCyclePin        /"schedCpuCycleMax"),4.0) else round(100*schedCpuCyclePin        /NULLIFZERO(60*1000000*cpu_speed*cpu_cores_per_ctrlr),4.0) end) as cpu_pct_Pin,
+  ZEROIFNULL(case when "schedCpuCycleMax" > 0 then round(100*(schedCpuCycleRaidResync /"schedCpuCycleMax"),4.0) else round(100*schedCpuCycleRaidResync /NULLIFZERO(60*1000000*cpu_speed*cpu_cores_per_ctrlr),4.0) end) as cpu_pct_RaidResync,
+  ZEROIFNULL(case when "schedCpuCycleMax" > 0 then round(100*(schedCpuCycleRepl       /"schedCpuCycleMax"),4.0) else round(100*schedCpuCycleRepl       /NULLIFZERO(60*1000000*cpu_speed*cpu_cores_per_ctrlr),4.0) end) as cpu_pct_Repl,
+  ZEROIFNULL(case when "schedCpuCycleMax" > 0 then round(100*(schedCpuCycleSysHiPrio  /"schedCpuCycleMax"),4.0) else round(100*schedCpuCycleSysHiPrio  /NULLIFZERO(60*1000000*cpu_speed*cpu_cores_per_ctrlr),4.0) end) as cpu_pct_SysHiPrio,
+  ZEROIFNULL(case when "schedCpuCycleMax" > 0 then round(100*(schedCpuCycleDISyncBlack  /"schedCpuCycleMax"),4.0) else round(100*schedCpuCycleDISyncBlack  /NULLIFZERO(60*1000000*cpu_speed*cpu_cores_per_ctrlr),4.0) end) as cpu_pct_DISyncBlack,
+  ZEROIFNULL(case when "schedCpuCycleMax" > 0 then round(100*(schedCpuCycleDISyncWhite  /"schedCpuCycleMax"),4.0) else round(100*schedCpuCycleDISyncWhite  /NULLIFZERO(60*1000000*cpu_speed*cpu_cores_per_ctrlr),4.0) end) as cpu_pct_DISyncWhite,
+  ZEROIFNULL(case when "schedCpuCycleMax" > 0 then round(100*(schedCpuCycleSyncRep      /"schedCpuCycleMax"),4.0) else round(100*schedCpuCycleSyncRep      /NULLIFZERO(60*1000000*cpu_speed*cpu_cores_per_ctrlr),4.0) end) as cpu_pct_SyncRep,
+
+
+  ZEROIFNULL(case when "schedCpuCycleMax" > 0 then round(100*(subSchedCpuCycleBiAutogen  /"schedCpuCycleMax"),4.0) else round(100*subSchedCpuCycleBiAutogen  /NULLIFZERO(60*1000000*cpu_speed*cpu_cores_per_ctrlr),4.0) end) as sub_cpu_pct_BiAutogen,
+  ZEROIFNULL(case when "schedCpuCycleMax" > 0 then round(100*(subSchedCpuCycleDiAutogen  /"schedCpuCycleMax"),4.0) else round(100*subSchedCpuCycleDiAutogen  /NULLIFZERO(60*1000000*cpu_speed*cpu_cores_per_ctrlr),4.0) end) as sub_cpu_pct_DiAutogen,
+
+  schedCpuCycleMax,
+  schedDiskIoTotal,
+
+  ZEROIFNULL((100*schedDiskIoAutogen)    /NULLIFZERO(schedDiskIoTotal)) as disk_io_pct_Autogen,
+  ZEROIFNULL((100*schedDiskIoBgJobs)     /NULLIFZERO(schedDiskIoTotal)) as disk_io_pct_BgJobs,
+  ZEROIFNULL((100*schedDiskIoBinMig)     /NULLIFZERO(schedDiskIoTotal)) as disk_io_pct_BinMig,
+  ZEROIFNULL((100*schedDiskIoCISync)     /NULLIFZERO(schedDiskIoTotal)) as disk_io_pct_CISync,
+  ZEROIFNULL((100*schedDiskIoCkpt)       /NULLIFZERO(schedDiskIoTotal)) as disk_io_pct_Ckpt,
+  ZEROIFNULL((100*schedDiskIoCpOffload)  /NULLIFZERO(schedDiskIoTotal)) as disk_io_pct_CpOffload,
+  ZEROIFNULL((100*schedDiskIoDGc)        /NULLIFZERO(schedDiskIoTotal)) as disk_io_pct_DGc,
+  ZEROIFNULL((100*schedDiskIoDISync)     /NULLIFZERO(schedDiskIoTotal)) as disk_io_pct_DISync,
+  ZEROIFNULL((100*schedDiskIoDbbSync)    /NULLIFZERO(schedDiskIoTotal)) as disk_io_pct_DbbSync,
+  ZEROIFNULL((100*schedDiskIoDel)        /NULLIFZERO(schedDiskIoTotal)) as disk_io_pct_Del,
+  ZEROIFNULL((100*schedDiskIoFISync)     /NULLIFZERO(schedDiskIoTotal)) as disk_io_pct_FISync,
+  ZEROIFNULL((100*schedDiskIoFgHiPrio)   /NULLIFZERO(schedDiskIoTotal)) as disk_io_pct_FgHiPrio,
+  ZEROIFNULL((100*schedDiskIoFgIo)       /NULLIFZERO(schedDiskIoTotal)) as disk_io_pct_FgIo,
+  ZEROIFNULL((100*schedDiskIoMisc)       /NULLIFZERO(schedDiskIoTotal)) as disk_io_pct_Misc,
+  ZEROIFNULL((100*schedDiskIoPin)        /NULLIFZERO(schedDiskIoTotal)) as disk_io_pct_Pin,
+  ZEROIFNULL((100*schedDiskIoRaidResync) /NULLIFZERO(schedDiskIoTotal)) as disk_io_pct_RaidResync,
+  ZEROIFNULL((100*schedDiskIoRepl)       /NULLIFZERO(schedDiskIoTotal)) as disk_io_pct_Repl,
+  ZEROIFNULL((100*schedDiskIoSysHiPrio)  /NULLIFZERO(schedDiskIoTotal)) as disk_io_pct_SysHiPrio,
+  ZEROIFNULL((100*schedDiskIoSyncRep)       /NULLIFZERO(schedDiskIoTotal)) as disk_io_pct_SyncRep,
+
+  case when left(os_version,1) = '0' or os_version >= '2.2' then fUnpinnedData_newFormat         else fUnpinnedData_oldFormat         end as fUnpinnedData_frxn,
+  case when left(os_version,1) = '0' or os_version >= '2.2' then fCi_newFormat                   else fCi_oldFormat                   end as fCi_frxn,
+  case when left(os_version,1) = '0' or os_version >= '2.2' then fBiDi_newFormat                 else fBiDi_oldFormat                 end as fBiDi_frxn,
+  case when left(os_version,1) = '0' or os_version >= '2.2' then fPinnedData_newFormat           else fPinnedData_oldFormat           end as fPinnedData_frxn,
+  case when left(os_version,1) = '0' or os_version >= '2.2' then fClaimed_newFormat              else fClaimed_oldFormat              end as fClaimed_frxn,
+  case when left(os_version,1) = '0' or os_version >= '2.2' then fUnclaimed_newFormat            else fUnclaimed_oldFormat            end as fUnclaimed_frxn,
+  case when left(os_version,1) = '0' or os_version >= '2.2' then fAvailForData_newFormat         else fAvailForData_oldFormat         end as fAvailForData_frxn,
+  case when left(os_version,1) = '0' or os_version >= '2.2' then fAvailForUnpinnedData_newFormat else fAvailForUnpinnedData_oldFormat end as fAvailForUnpinnedData_frxn,
+
+  case when left(os_version,1) = '0' or os_version >= '2.2' then dData_newFormat                 else dData_oldFormat                 end as dData_frxn,
+  case when left(os_version,1) = '0' or os_version >= '2.2' then dDisktop_newFormat              else dDisktop_oldFormat              end as dDisktop_frxn,
+  case when left(os_version,1) = '0' or os_version >= '2.2' then dDi_newFormat                   else dDi_oldFormat                   end as dDi_frxn,
+  case when left(os_version,1) = '0' or os_version >= '2.2' then dBi_newFormat                   else dBi_oldFormat                   end as dBi_frxn,
+  case when left(os_version,1) = '0' or os_version >= '2.2' then dHeatmap_newFormat              else dHeatmap_oldFormat              end as dHeatmap_frxn,
+  case when left(os_version,1) = '0' or os_version >= '2.2' then dFi_newFormat                   else dFi_oldFormat                   end as dFi_frxn,
+  case when left(os_version,1) = '0' or os_version >= '2.2' then dFd_newFormat                   else dFd_oldFormat                   end as dFd_frxn,
+  case when left(os_version,1) = '0' or os_version >= '2.2' then dClaimed_newFormat              else dClaimed_oldFormat              end as dClaimed_frxn,
+  case when left(os_version,1) = '0' or os_version >= '2.2' then dUnclaimed_newFormat            else dUnclaimed_oldFormat            end as dUnclaimed_frxn,
+
+  ns_ssd_miss_pct,
+  seq_ssd_miss_pct,
+  hdd_skip_pct,
+
+  cache_bi_miss_pct,
+  cache_di_miss_pct,
+  cache_fi_miss_pct,
+  write_skip_cache_pct,
+  rmiss_skip_cache_pct,
+  total_skip_cache_pct,
+
+  ssd_count,
+  avg_ssd_r_mbps,
+  avg_ssd_w_mbps,
+  avg_ssd_mbps,
+  max_ssd_r_mbps,
+  max_ssd_w_mbps,
+  max_ssd_mbps,
+  avg_ssd_r_ops,
+  avg_ssd_w_ops,
+  avg_ssd_ops,
+  max_ssd_r_ops,
+  max_ssd_w_ops,
+  max_ssd_ops,
+  avg_ssd_busy_pct,
+  max_ssd_busy_pct,
+  avg_ssd_r_lat_ms,
+  avg_ssd_w_lat_ms,
+  avg_ssd_lat_ms,
+  max_ssd_r_lat_ms,
+  max_ssd_w_lat_ms,
+  max_ssd_lat_ms,
+  avg_ssd_r_queue_depth_llaw,
+  avg_ssd_w_queue_depth_llaw,
+  avg_ssd_queue_depth_llaw,
+  max_ssd_r_queue_depth_llaw,
+  max_ssd_w_queue_depth_llaw,
+  max_ssd_queue_depth_llaw,
+
+  hdd_count,
+  avg_hdd_r_mbps,
+  avg_hdd_w_mbps,
+  avg_hdd_mbps,
+  max_hdd_r_mbps,
+  max_hdd_w_mbps,
+  max_hdd_mbps,
+  avg_hdd_r_ops,
+  avg_hdd_w_ops,
+  avg_hdd_ops,
+  max_hdd_r_ops,
+  max_hdd_w_ops,
+  max_hdd_ops,
+  avg_hdd_busy_pct,
+  max_hdd_busy_pct,
+  avg_hdd_r_lat_ms,
+  avg_hdd_w_lat_ms,
+  avg_hdd_lat_ms,
+  max_hdd_r_lat_ms,
+  max_hdd_w_lat_ms,
+  max_hdd_lat_ms,
+  avg_hdd_r_queue_depth_llaw,
+  avg_hdd_w_queue_depth_llaw,
+  avg_hdd_queue_depth_llaw,
+  max_hdd_r_queue_depth_llaw,
+  max_hdd_w_queue_depth_llaw,
+  max_hdd_queue_depth_llaw,
+
+  coalesce(ulay_diag,ulay_sys) as unalign_underlay_ct,
+  coalesce(upause_diag,upause_sys) as unalign_underlay_pause_ct,
+  coalesce(ulay_diag,ulay_sys)/(NULLIFZERO(rrops + rwops + srops + swops)*60) as underlay_pct_of_io,
+  coalesce(upause_diag,upause_sys)/(NULLIFZERO(rrops + rwops + srops + swops)*60) as underlay_pause_pct_of_io,
+  unalign_fixable_pct,
+  unalign_unfixable_pct,
+  unalign_maybe_fixable_pct,
+  unalign_offset_pct,
+  unalign_length_pct,
+  unalign_case1_pct,
+  unalign_case2_pct,
+  unalign_case3_pct,
+  unalign_case4_pct,
+  unalign_case5_pct,
+
+  net_inerr_pct,
+  net_retrans_pct,
+  net_inerr_ct,
+  net_retrans_ct,
+  net_inseg_ct,
+  net_outseg_ct,
+
+  unmapZeroCount,
+  unmapZeroBlocks,
+  unmapWriteSameCount,
+  unmapWriteSameBlocks,
+  unmapRequestCount,
+  unmapRequestBlocks,
+
+  replRxBlocks,
+  replRxDataBytes,
+  replTxBlocks,
+  replTxDataBytes,
+
+ --SYNC REP SENSORS
+  snapReplRxBlocks,
+  snapReplRxDataBytes,
+  snapReplTxBlocks,
+  snapReplTxDataBytes,
+  syncReplRxBlocks,
+  syncReplRxDataBytes,
+  syncReplTxBlocks,
+  syncReplTxDataBytes,
+  syncReplTotalMsec,
+  syncReplTxOps,
+
+  vmSrepResyncDataRxBytes,
+  vmSrepResyncDataTxBytes,
+  vmSrepResyncDataTxOpFailures,
+  vmSrepResyncDataTxOpRetries,
+
+  partner_out_of_sync_11031,
+  partner_in_sync_11032,
+  some_volcoll_out_of_sync_11033,
+  volcoll_in_sync_11034,
+
+  xcopyRequestCount,
+  xcopyBlocksCopied,
+  xcopyRequestTime, --can calculate xcopy request latency from this
+
+  odxReadRequestCount,
+  odxReadBlocks,
+  odxReadTime,
+  odxReadPartial,
+  odxWriteRequestCount,
+  odxWriteBlocks,
+  odxWriteTime,
+  odxWritePartial,
+
+  dedupeBlockCount, --from this calculate the proportion of blocks being in burst mode and the deduplication rate of the incoming data
+  dedupeBurstBlockCount,
+  dedupeZeroCount,
+  dedupeableTotalBlocks,
+  dedupeBurstDdupUesBlockCount,
+  dedupeBurstFiNvpgBlockCount,
+  dedupeBurstFiUbSzBlockCount,
+  dedupeBurstLowFlashBlockCount,
+
+  writeAdmitThrottleCount,
+  writeAdmitThrottleTime, --need to know the difference between the write and remote writa and how to determine the proportion of the latency that is due to throttling
+  readAdmitThrottleCount,
+  readAdmitThrottleTime,
+  remoteWriteAdmitThrottleCount,
+  remoteWriteAdmitThrottleTime,
+
+  readAdmitCloseWindowCount,
+  readAdmitForceCloseWindowCount,
+  readAdmitForceOpenWindowCount,
+  readAdmitOpenWindowCount,
+  writeAdmitCloseWindowCount,
+  writeAdmitForceCloseWindowCount,
+  writeAdmitForceOpenWindowCount,
+  writeAdmitOpenWindowCount,
+  remoteWriteAdmitCloseWindowCount,
+  remoteWriteAdmitForceCloseWindowCount,
+  remoteWriteAdmitForceOpenWindowCount,
+  remoteWriteAdmitOpenWindowCount,
+
+  dGcRedEntry,
+  dGcRedExit,
+  fGcRedEntry,
+  fGcRedExit,
+  dGcBytesReapedRED,
+  dGcNumBlkReapedRED,
+  fGcBytesReapedRED,
+  fGcNumBlkReapedRED,
+  busBiFlashWriteRed,
+  busBiRmissFlashRed,
+  busDataFlashWriteRed,
+  busDataRmissFlashRed,
+  busDiFlashWriteRed,
+  busDiRmissFlashRed,
+  busFiFlashWriteRed,
+  busFiRmissFlashRed,
+  busPinnedDataFlashWriteRed,
+  cacheRedCiCount,
+  cacheRedDataCount,
+  cacheRedDiBiCount,
+
+  ioThrottleCount, --general rules for distinguishing between throttling (user created or imposed by background tasks)
+  ioThrottleTime,
+
+  cacheMemLeakTagged,
+  cacheMemLeakReachable,
+  cacheMemLeakDetected,
+  cacheMemLeakHighRefCnt,
+  cacheMemLeakFreed,
+  cacheMemLeakWait,
+  cacheMemLeakCheck,
+  cacheMemLeakCheckStarted,
+
+  (coalesce(numIopsLimitThrottleCntSystem,0)+coalesce(numIopsLimitThrottleCntFolder,0)+coalesce(numIopsLimitThrottleCntVolume,0)) as numIopsLimitThrottleCnt, --this represents the combination of all system, folder and volume level throttling
+  (coalesce(numMbpsLimitThrottleCntSystem,0)+coalesce(numMbpsLimitThrottleCntFolder,0)+coalesce(numMbpsLimitThrottleCntVolume,0)) as numMbpsLimitThrottleCnt,
+  (coalesce(iopsLimitThrottleCyclesSystem,0)+coalesce(iopsLimitThrottleCyclesFolder,0)+coalesce(iopsLimitThrottleCyclesVolume,0)) as iopsLimitThrottleCycles,
+  (coalesce(mbpsLimitThrottleCyclesSystem,0)+coalesce(mbpsLimitThrottleCyclesFolder,0)+coalesce(mbpsLimitThrottleCyclesVolume,0)) as mbpsLimitThrottleCycles,
+
+  "nsNumReadS0B-512B",
+  "nsNumReadS512B-1k",
+  "nsNumReadS1k-2k",
+  "nsNumReadS2k-4k",
+  "nsNumReadS4k-8k",
+  "nsNumReadS8k-16k",
+  "nsNumReadS16k-32k",
+  "nsNumReadS32k-64k",
+  "nsNumReadS64k-128k",
+  "nsNumReadS128k-256k",
+  "nsNumReadS256k-512k",
+  "nsNumReadS512k-max",
+  "seqNumReadS0B-512B",
+  "seqNumReadS512B-1k",
+  "seqNumReadS1k-2k",
+  "seqNumReadS2k-4k",
+  "seqNumReadS4k-8k",
+  "seqNumReadS8k-16k",
+  "seqNumReadS16k-32k",
+  "seqNumReadS32k-64k",
+  "seqNumReadS64k-128k",
+  "seqNumReadS128k-256k",
+  "seqNumReadS256k-512k",
+  "seqNumReadS512k-max",
+  "numWriteS0B-512B",
+  "numWriteS512B-1k",
+  "numWriteS1k-2k",
+  "numWriteS2k-4k",
+  "numWriteS4k-8k",
+  "numWriteS8k-16k",
+  "numWriteS16k-32k",
+  "numWriteS32k-64k",
+  "numWriteS64k-128k",
+  "numWriteS128k-256k",
+  "numWriteS256k-512k",
+  "numWriteS512k-max",
+  "nsTimeReadS0B-512B",
+  "nsTimeReadS512B-1k",
+  "nsTimeReadS1k-2k",
+  "nsTimeReadS2k-4k",
+  "nsTimeReadS4k-8k",
+  "nsTimeReadS8k-16k",
+  "nsTimeReadS16k-32k",
+  "nsTimeReadS32k-64k",
+  "nsTimeReadS64k-128k",
+  "nsTimeReadS128k-256k",
+  "nsTimeReadS256k-512k",
+  "nsTimeReadS512k-max",
+  "seqTimeReadS0B-512B",
+  "seqTimeReadS512B-1k",
+  "seqTimeReadS1k-2k",
+  "seqTimeReadS2k-4k",
+  "seqTimeReadS4k-8k",
+  "seqTimeReadS8k-16k",
+  "seqTimeReadS16k-32k",
+  "seqTimeReadS32k-64k",
+  "seqTimeReadS64k-128k",
+  "seqTimeReadS128k-256k",
+  "seqTimeReadS256k-512k",
+  "seqTimeReadS512k-max",
+  "timeWriteS0B-512B",
+  "timeWriteS512B-1k",
+  "timeWriteS1k-2k",
+  "timeWriteS2k-4k",
+  "timeWriteS4k-8k",
+  "timeWriteS8k-16k",
+  "timeWriteS16k-32k",
+  "timeWriteS32k-64k",
+  "timeWriteS64k-128k",
+  "timeWriteS128k-256k",
+  "timeWriteS256k-512k",
+  "timeWriteS512k-max",
+
+  volume_count,
+  online_volume_count,
+  caching_volume_count,
+  aggressively_caching_volume_count,
+  pinned_volume_count,
+  deduping_volume_count,
+  iops_limit_volume_count,
+  mbps_limit_volume_count,
+
+  readsVolume,
+  writesVolume,
+  readBytesVolume,
+  writeBytesVolume,
+
+  encrypted_reads_pct,
+  encrypted_writes_pct,
+  encrypted_readBytes_pct,
+  encrypted_writeBytes_pct,
+  deduping_reads_pct,
+  deduping_writes_pct,
+  deduping_readBytes_pct,
+  deduping_writeBytes_pct,
+
+  ns_read_from_cached_volumes_pct,
+  seq_read_from_cached_volumes_pct,
+  ns_read_from_aggressively_cached_volumes_pct,
+  seq_read_from_aggressively_cached_volumes_pct,
+  ns_read_from_pinned_volumes_pct,
+  seq_read_from_pinned_volumes_pct,
+
+  ns_ssd_miss_from_cached_volumes_pct,
+  seq_ssd_miss_from_cached_volumes_pct,
+  ns_ssd_miss_from_aggressively_cached_volumes_pct,
+  seq_ssd_miss_from_aggressively_cached_volumes_pct,
+  ns_ssd_miss_from_pinned_volumes_pct,
+  seq_ssd_miss_from_pinned_volumes_pct,
+
+  ns_mem_miss_from_cached_volumes_pct,
+  seq_mem_miss_from_cached_volumes_pct,
+  ns_mem_miss_from_aggressively_cached_volumes_pct,
+  seq_mem_miss_from_aggressively_cached_volumes_pct,
+  ns_mem_miss_from_pinned_volumes_pct,
+  seq_mem_miss_from_pinned_volumes_pct,
+
+  writes_to_deduping_volumes_with_lt_5pct_dedupe_pct,
+  writes_to_deduping_volumes_with_lt_2pct_dedupe_pct,
+  writes_to_deduping_volumes_with_lt_1pct_dedupe_pct,
+  writes_to_deduping_volumes_with_0pct_dedupe_pct,
+
+  volume_count_1pct_compression,
+  volume_writes_uncompressible_pct,
+  volume_reads_uncompressible_pct,
+  volume_usage_uncompressible_pct,
+  volume_io_with_5pct_unaligment_pct,
+  volume_io_with_10pct_unaligment_pct,
+  volume_io_with_20pct_unaligment_pct,
+  volume_io_with_50pct_unaligment_pct,
+  volume_io_with_80pct_unaligment_pct,
+  volume_io_with_90pct_unaligment_pct,
+  volume_io_with_95pct_unaligment_pct,
+
+  round(ZEROIFNULL((coalesce(numIopsLimitThrottleCntSystem,0)+coalesce(numIopsLimitThrottleCntFolder,0)+coalesce(numIopsLimitThrottleCntVolume,0))/NULLIFZERO((readsVolume+writesVolume)))*100,4)::float as iops_limit_iops_throttle_pct,
+  round(ZEROIFNULL((coalesce(numMbpsLimitThrottleCntSystem,0)+coalesce(numMbpsLimitThrottleCntFolder,0)+coalesce(numMbpsLimitThrottleCntVolume,0))/NULLIFZERO((readBytesVolume+writeBytesVolume)/(1024^2)))*100,4)::float as mbps_limit_mbps_throttle_pct,
+  round(ZEROIFNULL((coalesce(iopsLimitThrottleCyclesSystem,0)+coalesce(iopsLimitThrottleCyclesFolder,0)+coalesce(iopsLimitThrottleCyclesVolume,0))/NULLIFZERO((schedCpuCycleMax)))*100,4)::float as iops_limit_cycle_throttle_pct,
+  round(ZEROIFNULL((coalesce(mbpsLimitThrottleCyclesSystem,0)+coalesce(mbpsLimitThrottleCyclesFolder,0)+coalesce(mbpsLimitThrottleCyclesVolume,0))/NULLIFZERO((schedCpuCycleMax)))*100,4)::float as mbps_limit_cycle_throttle_pct,
+
+  round(ZEROIFNULL((numIopsLimitThrottleCntSystem)/NULLIFZERO((readsVolume+writesVolume)))*100,4)::float as system_iops_limit_iops_throttle_pct,
+  round(ZEROIFNULL((numMbpsLimitThrottleCntSystem)/NULLIFZERO((readBytesVolume+writeBytesVolume)/(1024^2)))*100,4)::float as system_mbps_limit_mbps_throttle_pct,
+  round(ZEROIFNULL((iopsLimitThrottleCyclesSystem)/NULLIFZERO((schedCpuCycleMax)))*100,4)::float as system_iops_limit_cycle_throttle_pct,
+  round(ZEROIFNULL((mbpsLimitThrottleCyclesSystem)/NULLIFZERO((schedCpuCycleMax)))*100,4)::float as system_mbps_limit_cycle_throttle_pct,
+
+  round(ZEROIFNULL((numIopsLimitThrottleCntFolder)/NULLIFZERO((readsVolume+writesVolume)))*100,4)::float as folder_iops_limit_iops_throttle_pct,
+  round(ZEROIFNULL((numMbpsLimitThrottleCntFolder)/NULLIFZERO((readBytesVolume+writeBytesVolume)/(1024^2)))*100,4)::float as folder_mbps_limit_mbps_throttle_pct,
+  round(ZEROIFNULL((iopsLimitThrottleCyclesFolder)/NULLIFZERO((schedCpuCycleMax)))*100,4)::float as folder_iops_limit_cycle_throttle_pct,
+  round(ZEROIFNULL((mbpsLimitThrottleCyclesFolder)/NULLIFZERO((schedCpuCycleMax)))*100,4)::float as folder_mbps_limit_cycle_throttle_pct,
+
+  round(ZEROIFNULL((numIopsLimitThrottleCntVolume)/NULLIFZERO((readsVolume+writesVolume)))*100,4)::float as volume_iops_limit_iops_throttle_pct,
+  round(ZEROIFNULL((numMbpsLimitThrottleCntVolume)/NULLIFZERO((readBytesVolume+writeBytesVolume)/(1024^2)))*100,4)::float as volume_mbps_limit_mbps_throttle_pct,
+  round(ZEROIFNULL((iopsLimitThrottleCyclesVolume)/NULLIFZERO((schedCpuCycleMax)))*100,4)::float as volume_iops_limit_cycle_throttle_pct,
+  round(ZEROIFNULL((mbpsLimitThrottleCyclesVolume)/NULLIFZERO((schedCpuCycleMax)))*100,4)::float as volume_mbps_limit_cycle_throttle_pct,
+
+  ZEROIFNULL(round(100*((coalesce(schedCpuReadCycles,0)+coalesce(schedCpuWriteCycles,0)+coalesce(schedCpuContinueCycles,0))/NULLIFZERO("schedCpuCycleMax")),4.0)) as volume_alloc_cpu_busy_pct,
+
+  ns_mem_miss_pct,
+  seq_mem_miss_pct,
+
+
+  redPctGc,
+  redPctFlashGcUe,
+  redPctDiUe,
+  dGcPctLiveLogical,
+  dGcPctLiveDi,
+  ueNumDiDeletions,
+  ueNumDi,
+  uePctDi,
+  vmNumPendingGenDels,
+
+  schedCpuWeightAutogen,
+  schedCpuWeightCISync,
+  schedCpuWeightDbbSync,
+  schedCpuWeightDel,
+  schedCpuWeightDGc,
+  schedCpuWeightDISync,
+  schedCpuWeightFGc,
+  schedCpuWeightFISync,
+  schedCpuWeightPin,
+  schedDiskWeightAutogen,
+  schedDiskWeightCISync,
+  schedDiskWeightDbbSync,
+  schedDiskWeightDel,
+  schedDiskWeightDGc,
+  schedDiskWeightDISync,
+  schedDiskWeightFISync,
+  schedDiskWeightPin,
+  fi_size_gb,
+
+  --peercoral and new classifiers sensors
+  cpuQueueAvgSize,
+  schedQueueSizeDbbSync,
+  schedCpuQueueSizeDbbSync,
+  schedCpuQueueSizeFgIo,
+  atmItdCpuSaturatedCnt,
+  dbbSyncBytes,
+  cacheDataMiss,
+  dGcNumSegAlloc,
+  txnCommitLatCpu,
+  txnCommitPage,
+  iscsiReadTxqLat,
+  iscsiWriteTxqLat,
+  scsiWriteSubmitTime,
+  cacheFiHitMem,
+  cacheFiMiss,
+  cacheAddFiNode,
+  pgPctNv
+
+from dssysdiff
+---------------------------------
+-- sensors0.array_ds_diag_diff --
+---------------------------------
+left outer join dsdiagdiff
+on dssysdiff.sn = dsdiagdiff.sn and dssysdiff.ts = dsdiagdiff.ts
+--------------------------------------
+-- sensors0.array_ds_diag_spot_spot --
+--------------------------------------
+left outer join dsdiagspotspot
+on dssysdiff.sn = dsdiagspotspot.sn and dssysdiff.ts = dsdiagspotspot.ts
+-------------------------------------
+-- sensors0.ctrlr_sys_netsnmp_diff --
+-------------------------------------
+left outer join net
+on dssysdiff.sn = net.sn and dssysdiff.ts = net.ts
+-------------------------------------
+-- sensors0.array_sys_disk_hd_diff --
+-------------------------------------
+left outer join (
+select
+  "Array SN" as sn,
+  "Array Hostname" as hn,
+  "Sensors Local Date" as day,
+  "Sensors Local Timestamp" as ts,
+  "Sensors Local Epoch" as epo,
+  count(distinct "Disk Serialno") as hdd_count,
+  round(ZEROIFNULL(sum(coalesce("readBytes",0))/NULLIFZERO(count(distinct "Disk Serialno"))/(60.0*1024.0*1024.0)),2)::float as avg_hdd_r_mbps,
+  round(ZEROIFNULL(sum(coalesce("writeBytes",0))/NULLIFZERO(count(distinct "Disk Serialno"))/(60.0*1024.0*1024.0)),2)::float as avg_hdd_w_mbps,
+  round(ZEROIFNULL(sum(coalesce("readBytes"+"writeBytes",0))/NULLIFZERO(count(distinct "Disk Serialno"))/(60.0*1024.0*1024.0)),2)::float as avg_hdd_mbps,
+  round(max("readBytes")/(60.0*1024.0*1024.0),2)::float as max_hdd_r_mbps,
+  round(max("writeBytes")/(60.0*1024.0*1024.0),2)::float as max_hdd_w_mbps,
+  round(max("readBytes"+"writeBytes")/(60.0*1024.0*1024.0),2)::float as max_hdd_mbps,
+  round(ZEROIFNULL(sum(coalesce("readIos",0))/NULLIFZERO(count(distinct "Disk Serialno")))/60.0,2)::float as avg_hdd_r_ops,
+  round(ZEROIFNULL(sum(coalesce("writeIos",0))/NULLIFZERO(count(distinct "Disk Serialno")))/60.0,2)::float as avg_hdd_w_ops,
+  round(ZEROIFNULL(sum(coalesce("readIos"+"writeIos",0))/NULLIFZERO(count(distinct "Disk Serialno")))/60.0,2)::float as avg_hdd_ops,
+  round(max("readIos")/(60.0),2)::float as max_hdd_r_ops,
+  round(max("writeIos")/(60.0),2)::float as max_hdd_w_ops,
+  round(max("readIos"+"writeIos")/(60.0),2)::float as max_hdd_ops,
+  round(ZEROIFNULL(100.0*(sum(coalesce("totalMsecs",0))/NULLIFZERO(count(distinct "Disk Serialno"))))/60000.0,2)::float as avg_hdd_busy_pct,
+  CASE WHEN (round(ZEROIFNULL(100.0*max("totalMsecs"))/60000.0,2)::float)>100 THEN 100 else (round(ZEROIFNULL(100.0*max("totalMsecs"))/60000.0,2)::float)  END AS max_hdd_busy_pct,
+  round(ZEROIFNULL(sum(coalesce("readMsecs",0))/NULLIFZERO(sum("readIos"))),2)::float as avg_hdd_r_lat_ms,
+  round(ZEROIFNULL(sum(coalesce("writeMsecs",0))/NULLIFZERO(sum("writeIos"))),2)::float as avg_hdd_w_lat_ms,
+  round(ZEROIFNULL(sum(coalesce("readMsecs"+"writeMsecs",0))/NULLIFZERO(sum("readIos"+"writeIos"))),2)::float as avg_hdd_lat_ms,
+  round(ZEROIFNULL(max("readMsecs"/NULLIFZERO("readIos"))),2)::float as max_hdd_r_lat_ms,
+  round(ZEROIFNULL(max("writeMsecs"/NULLIFZERO("writeIos"))),2)::float as max_hdd_w_lat_ms,
+  round(ZEROIFNULL(max(("readMsecs"+"writeMsecs")/NULLIFZERO("readIos"+"writeIos"))),2)::float as max_hdd_lat_ms,
+  round(ZEROIFNULL(sum(coalesce("readMsecs",0))/NULLIFZERO(count(distinct "Disk Serialno")))/60000.0,3)::float as avg_hdd_r_queue_depth_llaw,
+  round(ZEROIFNULL(sum(coalesce("writeMsecs",0))/NULLIFZERO(count(distinct "Disk Serialno")))/60000.0,3)::float as avg_hdd_w_queue_depth_llaw,
+  round(ZEROIFNULL(sum(coalesce("readMsecs"+"writeMsecs",0))/NULLIFZERO(count(distinct "Disk Serialno")))/60000.0,3)::float as avg_hdd_queue_depth_llaw,
+  round(ZEROIFNULL(max(coalesce("readMsecs",0)))/60000.0,3)::float as max_hdd_r_queue_depth_llaw,
+  round(ZEROIFNULL(max(coalesce("writeMsecs",0)))/60000.0,3)::float as max_hdd_w_queue_depth_llaw,
+  round(ZEROIFNULL(max(coalesce("readMsecs"+"writeMsecs",0)))/60000.0,3)::float as max_hdd_queue_depth_llaw
+from
+  sensors0.array_sys_disk_hd_diff s
+  inner join array_lvl_perf_pipeline_scope q on s."Array SN" = q.array_sn
+where
+      "Sensors Local Month" >= date_trunc('month', start_ts)
+  and "Sensors Local Month" <= date_trunc('month', end_ts)
+  and "Sensors Local Week" >= date_trunc('week', start_ts)
+  and "Sensors Local Week" <= date_trunc('week', end_ts)
+  and "Sensors Local Date" >= date_trunc('day', start_ts)
+  and "Sensors Local Date" <= date_trunc('day', end_ts)
+  and "Sensors Local Timestamp" >= start_ts
+  and "Sensors Local Timestamp" < end_ts
+  and "Grain" = 'pm'
+  group by "Array SN", "Array Hostname", "Sensors Local Date", "Sensors Local Timestamp", "Sensors Local Epoch") hdd
+on dssysdiff.sn = hdd.sn and dssysdiff.ts = hdd.ts
+-------------------------------------
+-- sensors0.array_sys_disk_ss_diff --
+-------------------------------------
+left outer join (
+select
+  "Array SN" as sn,
+  "Array Hostname" as hn,
+  "Sensors Local Date" as day,
+  "Sensors Local Timestamp" as ts,
+  "Sensors Local Epoch" as epo,
+  count(distinct "Disk Serialno") as ssd_count,
+  round(ZEROIFNULL(sum(coalesce("readBytes",0))/NULLIFZERO(count(distinct "Disk Serialno"))/(60.0*1024.0*1024.0)),2)::float as avg_ssd_r_mbps,
+  round(ZEROIFNULL(sum(coalesce("writeBytes",0))/NULLIFZERO(count(distinct "Disk Serialno"))/(60.0*1024.0*1024.0)),2)::float as avg_ssd_w_mbps,
+  round(ZEROIFNULL(sum(coalesce("readBytes"+"writeBytes",0))/NULLIFZERO(count(distinct "Disk Serialno"))/(60.0*1024.0*1024.0)),2)::float as avg_ssd_mbps,
+  round(max("readBytes")/(60.0*1024.0*1024.0),2)::float as max_ssd_r_mbps,
+  round(max("writeBytes")/(60.0*1024.0*1024.0),2)::float as max_ssd_w_mbps,
+  round(max("readBytes"+"writeBytes")/(60.0*1024.0*1024.0),2)::float as max_ssd_mbps,
+  round(ZEROIFNULL(sum(coalesce("readIos",0))/NULLIFZERO(count(distinct "Disk Serialno")))/60.0,2)::float as avg_ssd_r_ops,
+  round(ZEROIFNULL(sum(coalesce("writeIos",0))/NULLIFZERO(count(distinct "Disk Serialno")))/60.0,2)::float as avg_ssd_w_ops,
+  round(ZEROIFNULL(sum(coalesce("readIos"+"writeIos",0))/NULLIFZERO(count(distinct "Disk Serialno")))/60.0,2)::float as avg_ssd_ops,
+  round(max("readIos")/(60.0),2)::float as max_ssd_r_ops,
+  round(max("writeIos")/(60.0),2)::float as max_ssd_w_ops,
+  round(max("readIos"+"writeIos")/(60.0),2)::float as max_ssd_ops,
+  round(ZEROIFNULL(100.0*(sum(coalesce("totalMsecs",0))/NULLIFZERO(count(distinct "Disk Serialno"))))/60000.0,2)::float as avg_ssd_busy_pct,
+  round(ZEROIFNULL(100.0*max("totalMsecs"))/60000.0,2)::float as max_ssd_busy_pct,
+  round(ZEROIFNULL(sum(coalesce("readMsecs",0))/NULLIFZERO(sum("readIos"))),2)::float as avg_ssd_r_lat_ms,
+  round(ZEROIFNULL(sum(coalesce("writeMsecs",0))/NULLIFZERO(sum("writeIos"))),2)::float as avg_ssd_w_lat_ms,
+  round(ZEROIFNULL(sum(coalesce("readMsecs"+"writeMsecs",0))/NULLIFZERO(sum("readIos"+"writeIos"))),2)::float as avg_ssd_lat_ms,
+  round(ZEROIFNULL(max("readMsecs"/NULLIFZERO("readIos"))),2)::float as max_ssd_r_lat_ms,
+  round(ZEROIFNULL(max("writeMsecs"/NULLIFZERO("writeIos"))),2)::float as max_ssd_w_lat_ms,
+  round(ZEROIFNULL(max(("readMsecs"+"writeMsecs")/NULLIFZERO("readIos"+"writeIos"))),2)::float as max_ssd_lat_ms,
+  round(ZEROIFNULL(sum(coalesce("readMsecs",0))/NULLIFZERO(count(distinct "Disk Serialno")))/60000.0,3)::float as avg_ssd_r_queue_depth_llaw,
+  round(ZEROIFNULL(sum(coalesce("writeMsecs",0))/NULLIFZERO(count(distinct "Disk Serialno")))/60000.0,3)::float as avg_ssd_w_queue_depth_llaw,
+  round(ZEROIFNULL(sum(coalesce("readMsecs"+"writeMsecs",0))/NULLIFZERO(count(distinct "Disk Serialno")))/60000.0,3)::float as avg_ssd_queue_depth_llaw,
+  round(ZEROIFNULL(max(coalesce("readMsecs",0)))/60000.0,3)::float as max_ssd_r_queue_depth_llaw,
+  round(ZEROIFNULL(max(coalesce("writeMsecs",0)))/60000.0,3)::float as max_ssd_w_queue_depth_llaw,
+  round(ZEROIFNULL(max(coalesce("readMsecs"+"writeMsecs",0)))/60000.0,3)::float as max_ssd_queue_depth_llaw
+from
+  sensors0.array_sys_disk_ss_diff s
+  inner join array_lvl_perf_pipeline_scope q on s."Array SN" = q.array_sn
+where
+      "Sensors Local Month" >= date_trunc('month', start_ts)
+  and "Sensors Local Month" <= date_trunc('month', end_ts)
+  and "Sensors Local Week" >= date_trunc('week', start_ts)
+  and "Sensors Local Week" <= date_trunc('week', end_ts)
+  and "Sensors Local Date" >= date_trunc('day', start_ts)
+  and "Sensors Local Date" <= date_trunc('day', end_ts)
+  and "Sensors Local Timestamp" >= start_ts
+  and "Sensors Local Timestamp" < end_ts
+  and "Grain" = 'pm'
+  group by "Array SN", "Array Hostname", "Sensors Local Date", "Sensors Local Timestamp", "Sensors Local Epoch") ssd
+on dssysdiff.sn = ssd.sn and dssysdiff.ts = ssd.ts
+----------------------------------
+-- sensors0.array_ds_alloc_diff --
+----------------------------------
+left outer join (
+select
+  "Array SN" as sn,
+  "Array Hostname" as hn,
+  "Sensors Local Date" as day,
+  "Sensors Local Timestamp" as ts,
+  "Sensors Local Epoch" as epo,
+  schedCpuCycleAutogen,
+  schedCpuCycleBgJobs,
+  schedCpuCycleBinMig,
+  schedCpuCycleCISync,
+  schedCpuCycleCkpt,
+  schedCpuCycleCpOffload,
+  schedCpuCycleDGc,
+  schedCpuCycleDISync,
+  schedCpuCycleDbbSync,
+  schedCpuCycleDel,
+  schedCpuCycleDsdm,
+  schedCpuCycleFGc,
+  schedCpuCycleFISync,
+  schedCpuCycleFgHiPrio,
+  schedCpuCycleFgIo,
+  schedCpuCycleGc,
+  schedCpuCycleHiPrio,
+  schedCpuCycleIdle,
+  schedCpuCycleIo,
+  schedCpuCycleMirror,
+  schedCpuCycleMisc,
+  schedCpuCyclePin,
+  schedCpuCycleRaidResync,
+  schedCpuCycleRepl,
+  schedCpuCycleSysHiPrio,
+  schedCpuCycleMax,
+  subSchedCpuCycleBiAutogen,
+  subSchedCpuCycleDiAutogen,
+  schedDiskIoAutogen,
+  schedDiskIoBgJobs,
+  schedDiskIoBinMig,
+  schedDiskIoCISync,
+  schedDiskIoCkpt,
+  schedDiskIoCpOffload,
+  schedDiskIoDGc,
+  schedDiskIoDISync,
+  schedDiskIoDbbSync,
+  schedDiskIoDel,
+  schedDiskIoFISync,
+  schedDiskIoFgHiPrio,
+  schedDiskIoFgIo,
+  schedDiskIoMisc,
+  schedDiskIoPin,
+  schedDiskIoRaidResync,
+  schedDiskIoRepl,
+  schedDiskIoSysHiPrio,
+  schedCpuCycleDISyncBlack,
+  schedCpuCycleDISyncWhite,
+  schedCpuCycleSyncRep,
+  schedDiskIoSyncRep,
+  coalesce(schedDiskIoAutogen,0)+
+  coalesce(schedDiskIoBgJobs,0)+
+  coalesce(schedDiskIoBinMig,0)+
+  coalesce(schedDiskIoCISync,0)+
+  coalesce(schedDiskIoCkpt,0)+
+  coalesce(schedDiskIoCpOffload,0)+
+  coalesce(schedDiskIoDGc,0)+
+  coalesce(schedDiskIoDISync,0)+
+  coalesce(schedDiskIoDbbSync,0)+
+  coalesce(schedDiskIoDel,0)+
+  coalesce(schedDiskIoFISync,0)+
+  coalesce(schedDiskIoFgHiPrio,0)+
+  coalesce(schedDiskIoFgIo,0)+
+  coalesce(schedDiskIoMisc,0)+
+  coalesce(schedDiskIoPin,0)+
+  coalesce(schedDiskIoRaidResync,0)+
+  coalesce(schedDiskIoRepl,0)+
+  coalesce(schedDiskIoSysHiPrio,0) as schedDiskIoTotal
+from
+  sensors0.array_ds_alloc_diff s
+  inner join array_lvl_perf_pipeline_scope q on s."Array SN" = q.array_sn
+where
+      "Sensors Local Month" >= date_trunc('month', start_ts)
+  and "Sensors Local Month" <= date_trunc('month', end_ts)
+  and "Sensors Local Week" >= date_trunc('week', start_ts)
+  and "Sensors Local Week" <= date_trunc('week', end_ts)
+  and "Sensors Local Date" >= date_trunc('day', start_ts)
+  and "Sensors Local Date" <= date_trunc('day', end_ts)
+  and "Sensors Local Timestamp" >= start_ts
+  and "Sensors Local Timestamp" < end_ts
+  and "Grain" = 'pm'
+) alloc
+on dssysdiff.sn = alloc.sn and dssysdiff.ts = alloc.ts
+----------------------------------
+-- sensors0.array_ds_alloc_spot --
+----------------------------------
+left outer join (
+select
+  "Array SN" as sn,
+  "Array Hostname" as hn,
+  "Sensors Local Date" as day,
+  "Sensors Local Timestamp" as ts,
+  "Sensors Local Epoch" as epo,
+  schedCpuWeightAutogen,
+  schedCpuWeightCISync,
+  schedCpuWeightDbbSync,
+  schedCpuWeightDel,
+  schedCpuWeightDGc,
+  schedCpuWeightDISync,
+  schedCpuWeightFGc,
+  schedCpuWeightFISync,
+  schedCpuWeightPin,
+  schedDiskWeightAutogen,
+  schedDiskWeightCISync,
+  schedDiskWeightDbbSync,
+  schedDiskWeightDel,
+  schedDiskWeightDGc,
+  schedDiskWeightDISync,
+  schedDiskWeightFISync,
+  schedDiskWeightPin,
+  cpuQueueAvgSize,
+  schedQueueSizeDbbSync,
+  schedCpuQueueSizeDbbSync,
+  schedCpuQueueSizeFgIo
+from
+  sensors0.array_ds_alloc_spot s
+  inner join array_lvl_perf_pipeline_scope q on s."Array SN" = q.array_sn
+where
+      "Sensors Local Month" >= date_trunc('month', start_ts)
+  and "Sensors Local Month" <= date_trunc('month', end_ts)
+  and "Sensors Local Week" >= date_trunc('week', start_ts)
+  and "Sensors Local Week" <= date_trunc('week', end_ts)
+  and "Sensors Local Date" >= date_trunc('day', start_ts)
+  and "Sensors Local Date" <= date_trunc('day', end_ts)
+  and "Sensors Local Timestamp" >= start_ts
+  and "Sensors Local Timestamp" < end_ts
+  and "Grain" = 'pm'
+) allocspot
+on dssysdiff.sn = allocspot.sn and dssysdiff.ts = allocspot.ts
+---------------------------------
+-- sensors0.ctrlr_sys_cpu_diff --
+---------------------------------
+left outer join cpu
+on dssysdiff.sn = cpu.sn and dssysdiff.ts = cpu.ts
+---------------------------------
+-- sensors0.ctrlr_sys_nic_diff --
+---------------------------------
+left outer join nic
+on dssysdiff.sn = nic.sn and dssysdiff.ts = nic.ts
+-----------------------------------
+-- sensors0.array_ds_folder_diff --
+-----------------------------------
+left outer join  dsfolderdiff
+on dssysdiff.sn = dsfolderdiff.sn and dssysdiff.ts = dsfolderdiff.ts
+--------------------------------
+-- sensors0.array_ds_vol_diff --
+--------------------------------
+left outer join dsvoldiff
+on dssysdiff.sn = dsvoldiff.sn and dssysdiff.ts = dsvoldiff.ts
+--------------------------------------
+-- sensors0.array_ds_diag_spot --
+--------------------------------------
+left outer join  dsdiagspot
+on dssysdiff.sn = dsdiagspot.sn and dssysdiff.ts = dsdiagspot.ts
+
+--------------------------------------
+-- sensors0.array_ds_atm_diff --
+--------------------------------------
+left outer join  dsatmdiff
+on dssysdiff.sn = dsatmdiff.sn and dssysdiff.ts = dsatmdiff.ts
+--------------------------
+-- events0.log -- getting the fi size for afa
+--------------------------
+left outer join  fisize
+on dssysdiff.sn = fisize.sn and dssysdiff.ts = fisize.ts
+
+-----------------------------------------
+----- status0.events - getting alert information
+----------------------------------------
+left outer join statusevents
+on dssysdiff.sn = statusevents.sn and dssysdiff.ts = statusevents.ts
+
+--------------------------
+-- cube0.arrays_current --
+--------------------------
+left outer join  config
+on dssysdiff.sn = config.sn; --since this script is pulling from the arrays_current table - it is expecting to only be run on recent data; the config_info_day can help retroactively identify data integrity issues.
+
+select * from array_lvl_perf_joined limit 19;
+select count(*),count(distinct array_sn),min(ts),max(ts) from array_lvl_perf_joined;
+
+
+drop table if exists array_lvl_perf_joined_without_duplicates;
+create local temp table array_lvl_perf_joined_without_duplicates on commit preserve rows as
+select * from (select *, row_number() over (partition by array_sn, ts order by array_hn, epo) as rn from array_lvl_perf_joined) x where rn = 1;
+
+
+
+-------------------------------------------------------------------------------------------
+-------------------------------------------------------------------------------------------
+--- APPLICATION OF RECOMMENDATION SYNTHESIS ENGINE MODELS
+-------------------------------------------------------------------------------------------
+-------------------------------------------------------------------------------------------
+
+drop table if exists array_lvl_latency_severity_and_sizing_hfa;
+create local temp table array_lvl_latency_severity_and_sizing_hfa on commit preserve rows as select
+  array_sn,
+  array_hn,
+  day,
+  ts,
+  epo,
+
+  raw_model,
+  array_type,
+  array_series,
+  os_version,
+  config_info_day,
+
+  rrops,
+  rrmbps,
+  rwops,
+  rwmbps,
+  srops,
+  srmbps,
+  swops,
+  swmbps,
+  kbpr,
+  kbpw,
+
+  iops,
+  ns_read_ops_pct,
+  seq_read_ops_pct,
+  ns_write_ops_pct,
+  seq_write_ops_pct,
+  mbps,
+  ns_read_mbps_pct,
+  seq_read_mbps_pct,
+  ns_write_mbps_pct,
+  seq_write_mbps_pct,
+
+  full_rlat_ms,
+  full_wlat_ms,
+  red_rlat_pct,
+  red_wlat_pct,
+  ds_rlat_pct,
+  ds_wlat_pct,
+  queue_rlat_pct,
+  queue_wlat_pct,
+  internal_qos_rlat_pct,
+  internal_qos_wlat_pct,
+
+  io_red_delay_pct,
+  io_red_pct,
+
+  ioRedDelayTime,
+  ioRedDelayCount,
+  ioRedDelayMaxed,
+  ioRedCount,
+  ioRedDropCount,
+  ioRedStageCount,
+
+  cpu_busy_pct,
+
+  total_alloc_cpu_busy_pct,
+
+  cpu_pct_Autogen,
+  cpu_pct_BgJobs,
+  cpu_pct_BinMig,
+  cpu_pct_CISync,
+  cpu_pct_Ckpt,
+  cpu_pct_CpOffload,
+  cpu_pct_DGc,
+  cpu_pct_DISync,
+  cpu_pct_DbbSync,
+  cpu_pct_Del,
+  cpu_pct_Dsdm,
+  cpu_pct_FGc,
+  cpu_pct_FISync,
+  cpu_pct_FgHiPrio,
+  cpu_pct_FgIo,
+  cpu_pct_Gc,
+  cpu_pct_HiPrio,
+  cpu_pct_Idle,
+  cpu_pct_Io,
+  cpu_pct_Mirror,
+  cpu_pct_Misc,
+  cpu_pct_Pin,
+  cpu_pct_RaidResync,
+  cpu_pct_Repl,
+  cpu_pct_SysHiPrio,
+  --SYNC REP SENSORS
+  cpu_pct_DISyncBlack,
+  cpu_pct_DISyncWhite,
+  cpu_pct_SyncRep,
+  disk_io_pct_SyncRep,
+  snapReplRxBlocks,
+  snapReplRxDataBytes,
+  snapReplTxBlocks,
+  snapReplTxDataBytes,
+  syncReplRxBlocks,
+  syncReplRxDataBytes,
+  syncReplTxBlocks,
+  syncReplTxDataBytes,
+  syncReplTotalMsec,
+  syncReplTxOps,
+  sync_repl_downstream_ds_wlat_pct,
+  sync_repl_upstream_network_ds_wlat_pct,
+  sync_repl_upstream_wait_ds_wlat_pct,
+  sync_repl_downstream_wlat_pct,
+  sync_repl_upstream_network_wlat_pct,
+  sync_repl_upstream_wait_wlat_pct,
+  vmSrepResyncDataRxBytes,
+  vmSrepResyncDataTxBytes,
+  vmSrepResyncDataTxOpFailures,
+  vmSrepResyncDataTxOpRetries,
+  partner_out_of_sync_11031,
+  partner_in_sync_11032,
+  some_volcoll_out_of_sync_11033,
+  volcoll_in_sync_11034,
+
+  sub_cpu_pct_BiAutogen,
+  sub_cpu_pct_DiAutogen,
+
+  schedCpuCycleMax,
+  schedDiskIoTotal,
+
+  disk_io_pct_Autogen,
+  disk_io_pct_BgJobs,
+  disk_io_pct_BinMig,
+  disk_io_pct_CISync,
+  disk_io_pct_Ckpt,
+  disk_io_pct_CpOffload,
+  disk_io_pct_DGc,
+  disk_io_pct_DISync,
+  disk_io_pct_DbbSync,
+  disk_io_pct_Del,
+  disk_io_pct_FISync,
+  disk_io_pct_FgHiPrio,
+  disk_io_pct_FgIo,
+  disk_io_pct_Misc,
+  disk_io_pct_Pin,
+  disk_io_pct_RaidResync,
+  disk_io_pct_Repl,
+  disk_io_pct_SysHiPrio,
+
+  ns_ssd_miss_pct,
+  seq_ssd_miss_pct,
+  hdd_skip_pct,
+
+  cache_bi_miss_pct,
+  cache_di_miss_pct,
+  cache_fi_miss_pct,
+  write_skip_cache_pct,
+  rmiss_skip_cache_pct,
+  total_skip_cache_pct,
+
+  ssd_count,
+  avg_ssd_r_mbps,
+  avg_ssd_w_mbps,
+  avg_ssd_mbps,
+  max_ssd_r_mbps,
+  max_ssd_w_mbps,
+  max_ssd_mbps,
+  avg_ssd_r_ops,
+  avg_ssd_w_ops,
+  avg_ssd_ops,
+  max_ssd_r_ops,
+  max_ssd_w_ops,
+  max_ssd_ops,
+  avg_ssd_busy_pct,
+  max_ssd_busy_pct,
+  avg_ssd_r_lat_ms,
+  avg_ssd_w_lat_ms,
+  avg_ssd_lat_ms,
+  max_ssd_r_lat_ms,
+  max_ssd_w_lat_ms,
+  max_ssd_lat_ms,
+  avg_ssd_r_queue_depth_llaw,
+  avg_ssd_w_queue_depth_llaw,
+  avg_ssd_queue_depth_llaw,
+  max_ssd_r_queue_depth_llaw,
+  max_ssd_w_queue_depth_llaw,
+  max_ssd_queue_depth_llaw,
+
+  hdd_count,
+  avg_hdd_r_mbps,
+  avg_hdd_w_mbps,
+  avg_hdd_mbps,
+  max_hdd_r_mbps,
+  max_hdd_w_mbps,
+  max_hdd_mbps,
+  avg_hdd_r_ops,
+  avg_hdd_w_ops,
+  avg_hdd_ops,
+  max_hdd_r_ops,
+  max_hdd_w_ops,
+  max_hdd_ops,
+  avg_hdd_busy_pct,
+  max_hdd_busy_pct,
+  avg_hdd_r_lat_ms,
+  avg_hdd_w_lat_ms,
+  avg_hdd_lat_ms,
+  max_hdd_r_lat_ms,
+  max_hdd_w_lat_ms,
+  max_hdd_lat_ms,
+  avg_hdd_r_queue_depth_llaw,
+  avg_hdd_w_queue_depth_llaw,
+  avg_hdd_queue_depth_llaw,
+  max_hdd_r_queue_depth_llaw,
+  max_hdd_w_queue_depth_llaw,
+  max_hdd_queue_depth_llaw,
+
+  unalign_underlay_ct,
+  unalign_underlay_pause_ct,
+  underlay_pct_of_io,
+  underlay_pause_pct_of_io,
+  unalign_fixable_pct,
+  unalign_unfixable_pct,
+  unalign_maybe_fixable_pct,
+  unalign_offset_pct,
+  unalign_length_pct,
+  unalign_case1_pct,
+  unalign_case2_pct,
+  unalign_case3_pct,
+  unalign_case4_pct,
+  unalign_case5_pct,
+
+  net_inerr_pct,
+  net_retrans_pct,
+  net_inerr_ct,
+  net_retrans_ct,
+  net_inseg_ct,
+  net_outseg_ct,
+
+  unmapZeroCount,
+  unmapZeroBlocks,
+  unmapWriteSameCount,
+  unmapWriteSameBlocks,
+  unmapRequestCount,
+  unmapRequestBlocks,
+
+  replRxBlocks,
+  replRxDataBytes,
+  replTxBlocks,
+  replTxDataBytes,
+
+  xcopyRequestCount,
+  xcopyBlocksCopied,
+  xcopyRequestTime, --can calculate xcopy request latency from this
+
+  odxReadRequestCount,
+  odxReadBlocks,
+  odxReadTime,
+  odxReadPartial,
+  odxWriteRequestCount,
+  odxWriteBlocks,
+  odxWriteTime,
+  odxWritePartial,
+
+  dedupeBlockCount, --from this calculate the proportion of blocks being in burst mode and the deduplication rate of the incoming data
+  dedupeBurstBlockCount,
+  dedupeZeroCount,
+  dedupeableTotalBlocks,
+  dedupeBurstDdupUesBlockCount,
+  dedupeBurstFiNvpgBlockCount,
+  dedupeBurstFiUbSzBlockCount,
+  dedupeBurstLowFlashBlockCount,
+
+  writeAdmitThrottleCount,
+  writeAdmitThrottleTime, --need to know the difference between the write and remote writa and how to determine the proportion of the latency that is due to throttling
+  readAdmitThrottleCount,
+  readAdmitThrottleTime,
+  remoteWriteAdmitThrottleCount,
+  remoteWriteAdmitThrottleTime,
+
+  readAdmitCloseWindowCount,
+  readAdmitForceCloseWindowCount,
+  readAdmitForceOpenWindowCount,
+  readAdmitOpenWindowCount,
+  writeAdmitCloseWindowCount,
+  writeAdmitForceCloseWindowCount,
+  writeAdmitForceOpenWindowCount,
+  writeAdmitOpenWindowCount,
+  remoteWriteAdmitCloseWindowCount,
+  remoteWriteAdmitForceCloseWindowCount,
+  remoteWriteAdmitForceOpenWindowCount,
+  remoteWriteAdmitOpenWindowCount,
+
+  dGcRedEntry,
+  dGcRedExit,
+  fGcRedEntry,
+  fGcRedExit,
+  dGcBytesReapedRED,
+  dGcNumBlkReapedRED,
+  fGcBytesReapedRED,
+  fGcNumBlkReapedRED,
+  busBiFlashWriteRed,
+  busBiRmissFlashRed,
+  busDataFlashWriteRed,
+  busDataRmissFlashRed,
+  busDiFlashWriteRed,
+  busDiRmissFlashRed,
+  busFiFlashWriteRed,
+  busFiRmissFlashRed,
+  busPinnedDataFlashWriteRed,
+  cacheRedCiCount,
+  cacheRedDataCount,
+  cacheRedDiBiCount,
+
+  ioThrottleCount, --general rules for distinguishing between throttling (user created or imposed by background tasks)
+  ioThrottleTime,
+
+  cacheMemLeakTagged,
+  cacheMemLeakReachable,
+  cacheMemLeakDetected,
+  cacheMemLeakHighRefCnt,
+  cacheMemLeakFreed,
+  cacheMemLeakWait,
+  cacheMemLeakCheck,
+  cacheMemLeakCheckStarted,
+
+  numIopsLimitThrottleCnt, --ensure that if this is at the folder or volume level that the throttling will still be captured here
+  numMbpsLimitThrottleCnt,
+  iopsLimitThrottleCycles,
+  mbpsLimitThrottleCycles,
+
+  volume_count,
+  online_volume_count,
+  caching_volume_count,
+  aggressively_caching_volume_count,
+  pinned_volume_count,
+  deduping_volume_count,
+  iops_limit_volume_count,
+  mbps_limit_volume_count,
+  readsVolume,
+  writesVolume,
+  readBytesVolume,
+  writeBytesVolume,
+  encrypted_reads_pct,
+  encrypted_writes_pct,
+  encrypted_readBytes_pct,
+  encrypted_writeBytes_pct,
+  deduping_reads_pct,
+  deduping_writes_pct,
+  deduping_readBytes_pct,
+  deduping_writeBytes_pct,
+  ns_read_from_cached_volumes_pct,
+  seq_read_from_cached_volumes_pct,
+  ns_read_from_aggressively_cached_volumes_pct,
+  seq_read_from_aggressively_cached_volumes_pct,
+  ns_read_from_pinned_volumes_pct,
+  seq_read_from_pinned_volumes_pct,
+  ns_ssd_miss_from_cached_volumes_pct,
+  seq_ssd_miss_from_cached_volumes_pct,
+  ns_ssd_miss_from_aggressively_cached_volumes_pct,
+  seq_ssd_miss_from_aggressively_cached_volumes_pct,
+  ns_ssd_miss_from_pinned_volumes_pct,
+  seq_ssd_miss_from_pinned_volumes_pct,
+  ns_mem_miss_from_cached_volumes_pct,
+  seq_mem_miss_from_cached_volumes_pct,
+  ns_mem_miss_from_aggressively_cached_volumes_pct,
+  seq_mem_miss_from_aggressively_cached_volumes_pct,
+  ns_mem_miss_from_pinned_volumes_pct,
+  seq_mem_miss_from_pinned_volumes_pct,
+  writes_to_deduping_volumes_with_lt_5pct_dedupe_pct,
+  writes_to_deduping_volumes_with_lt_2pct_dedupe_pct,
+  writes_to_deduping_volumes_with_lt_1pct_dedupe_pct,
+  writes_to_deduping_volumes_with_0pct_dedupe_pct,
+  volume_count_1pct_compression,
+  volume_writes_uncompressible_pct,
+  volume_reads_uncompressible_pct,
+  volume_usage_uncompressible_pct,
+  volume_io_with_5pct_unaligment_pct,
+  volume_io_with_10pct_unaligment_pct,
+  volume_io_with_20pct_unaligment_pct,
+  volume_io_with_50pct_unaligment_pct,
+  volume_io_with_80pct_unaligment_pct,
+  volume_io_with_90pct_unaligment_pct,
+  volume_io_with_95pct_unaligment_pct,
+  iops_limit_iops_throttle_pct,
+  mbps_limit_mbps_throttle_pct,
+  iops_limit_cycle_throttle_pct,
+  mbps_limit_cycle_throttle_pct,
+  system_iops_limit_iops_throttle_pct,
+  system_mbps_limit_mbps_throttle_pct,
+  system_iops_limit_cycle_throttle_pct,
+  system_mbps_limit_cycle_throttle_pct,
+  folder_iops_limit_iops_throttle_pct,
+  folder_mbps_limit_mbps_throttle_pct,
+  folder_iops_limit_cycle_throttle_pct,
+  folder_mbps_limit_cycle_throttle_pct,
+  volume_iops_limit_iops_throttle_pct,
+  volume_mbps_limit_mbps_throttle_pct,
+  volume_iops_limit_cycle_throttle_pct,
+  volume_mbps_limit_cycle_throttle_pct,
+  volume_alloc_cpu_busy_pct,
+  ns_mem_miss_pct,
+  seq_mem_miss_pct,
+
+  fUnpinnedData_frxn,
+  fCi_frxn,
+  fBiDi_frxn,
+  fPinnedData_frxn,
+  fClaimed_frxn,
+  fUnclaimed_frxn,
+  fAvailForData_frxn,
+  fAvailForUnpinnedData_frxn,
+  dData_frxn,
+  dDisktop_frxn,
+  dDi_frxn,
+  dBi_frxn,
+  dHeatmap_frxn,
+  dFi_frxn,
+  dFd_frxn,
+  dClaimed_frxn,
+  dUnclaimed_frxn,
+
+
+  redPctGc,
+  redPctFlashGcUe,
+  redPctDiUe,
+  dGcPctLiveLogical,
+  dGcPctLiveDi,
+  ueNumDiDeletions,
+  ueNumDi,
+  uePctDi,
+  vmNumPendingGenDels,
+
+  schedCpuWeightAutogen,
+  schedCpuWeightCISync,
+  schedCpuWeightDbbSync,
+  schedCpuWeightDel,
+  schedCpuWeightDGc,
+  schedCpuWeightDISync,
+  schedCpuWeightFGc,
+  schedCpuWeightFISync,
+  schedCpuWeightPin,
+  schedDiskWeightAutogen,
+  schedDiskWeightCISync,
+  schedDiskWeightDbbSync,
+  schedDiskWeightDel,
+  schedDiskWeightDGc,
+  schedDiskWeightDISync,
+  schedDiskWeightFISync,
+  schedDiskWeightPin,
+  fi_size_gb,
+
+  --peercoral and new classifiers sensors
+  cpuQueueAvgSize,
+  schedQueueSizeDbbSync,
+  schedCpuQueueSizeDbbSync,
+  schedCpuQueueSizeFgIo,
+  atmItdCpuSaturatedCnt,
+  dbbSyncBytes,
+  cacheDataMiss,
+  dGcNumSegAlloc,
+  txnCommitLatCpu,
+  txnCommitPage,
+  iscsiReadTxqLat,
+  iscsiWriteTxqLat,
+  scsiWriteSubmitTime,
+  cacheFiHitMem,
+  cacheFiMiss,
+  cacheAddFiNode,
+  pgPctNv,
+
+--latency severity score calculations
+perf_sev_score("nsNumReadS512B-1k","nsNumReadS1k-2k","nsNumReadS2k-4k","nsNumReadS4k-8k","nsNumReadS8k-16k","nsNumReadS16k-32k","nsNumReadS32k-64k","nsNumReadS64k-128k","nsNumReadS128k-256k","nsNumReadS256k-512k","nsNumReadS512k-max","nsTimeReadS512B-1k","nsTimeReadS1k-2k","nsTimeReadS2k-4k","nsTimeReadS4k-8k","nsTimeReadS8k-16k","nsTimeReadS16k-32k","nsTimeReadS32k-64k","nsTimeReadS64k-128k","nsTimeReadS128k-256k","nsTimeReadS256k-512k","nsTimeReadS512k-max"
+      USING PARAMETERS op_type = 'nsRead', array_type = 'HFA', time_grain = 'hour') AS perf_sev_ns_read,
+perf_sev_score("seqNumReadS512B-1k","seqNumReadS1k-2k","seqNumReadS2k-4k","seqNumReadS4k-8k","seqNumReadS8k-16k","seqNumReadS16k-32k","seqNumReadS32k-64k","seqNumReadS64k-128k","seqNumReadS128k-256k","seqNumReadS256k-512k","seqNumReadS512k-max","seqTimeReadS512B-1k","seqTimeReadS1k-2k","seqTimeReadS2k-4k","seqTimeReadS4k-8k","seqTimeReadS8k-16k","seqTimeReadS16k-32k","seqTimeReadS32k-64k","seqTimeReadS64k-128k","seqTimeReadS128k-256k","seqTimeReadS256k-512k","seqTimeReadS512k-max"
+      USING PARAMETERS op_type = 'seqRead', array_type = 'HFA', time_grain = 'hour') AS perf_sev_seq_read,
+perf_sev_score("numWriteS512B-1k","numWriteS1k-2k","numWriteS2k-4k","numWriteS4k-8k","numWriteS8k-16k","numWriteS16k-32k","numWriteS32k-64k","numWriteS64k-128k","numWriteS128k-256k","numWriteS256k-512k","numWriteS512k-max","timeWriteS512B-1k","timeWriteS1k-2k","timeWriteS2k-4k","timeWriteS4k-8k","timeWriteS8k-16k","timeWriteS16k-32k","timeWriteS32k-64k","timeWriteS64k-128k","timeWriteS128k-256k","timeWriteS256k-512k","timeWriteS512k-max"
+      USING PARAMETERS op_type = 'write', array_type = 'HFA', time_grain = 'hour') AS perf_sev_write,
+--resource headroom models
+(rrops+srops)*e.read_iops_coeff + (rwops+swops)*e.write_iops_coeff + (rrmbps+srmbps)*1024*e.read_kbps_coeff + (rwmbps+swmbps)*1024*e.write_kbps_coeff as cpu_headroom_model_engineering,
+(rrops+srops)*i.read_iops_coeff + (rwops+swops)*i.write_iops_coeff + (rrmbps+srmbps)*1024*i.read_kbps_coeff + (rwmbps+swmbps)*1024*i.write_kbps_coeff as cpu_headroom_model_installbase,
+(100*cpu_busy_pct)*ZEROIFNULL(1/NULLIFZERO((rrops+srops)*e.read_iops_coeff + (rwops+swops)*e.write_iops_coeff + (rrmbps+srmbps)*1024*e.read_kbps_coeff + (rwmbps+swmbps)*1024*e.write_kbps_coeff)) as cpu_model_pct_of_actual_engineering,
+(100*cpu_busy_pct)*ZEROIFNULL(1/NULLIFZERO((rrops+srops)*i.read_iops_coeff + (rwops+swops)*i.write_iops_coeff + (rrmbps+srmbps)*1024*i.read_kbps_coeff + (rwmbps+swmbps)*1024*i.write_kbps_coeff)) as cpu_model_pct_of_actual_installbase,
+(cpu_busy_pct) - ((rrops+srops)*e.read_iops_coeff + (rwops+swops)*e.write_iops_coeff + (rrmbps+srmbps)*1024*e.read_kbps_coeff + (rwmbps+swmbps)*1024*e.write_kbps_coeff) as cpu_model_diff_of_actual_engineering,
+(cpu_busy_pct) - ((rrops+srops)*i.read_iops_coeff + (rwops+swops)*i.write_iops_coeff + (rrmbps+srmbps)*1024*i.read_kbps_coeff + (rwmbps+swmbps)*1024*i.write_kbps_coeff) as cpu_model_diff_of_actual_installbase
+from array_lvl_perf_joined_without_duplicates j
+left outer join (select * from reference0.io_headroom_pct_by_system where (source is null or source = 'engineering') and (coalesce(all_flash,true) = coalesce(deduplication_enabled,true))) e on e.system = array_series
+left outer join (select * from reference0.io_headroom_pct_by_system where (source is null or source = 'infosight')   and (coalesce(all_flash,true) = coalesce(deduplication_enabled,true))) i on i.system = array_series
+where array_type = 'HFA';
+
+
+drop table if exists array_lvl_latency_severity_and_sizing_afa;
+create local temp table array_lvl_latency_severity_and_sizing_afa on commit preserve rows as select
+  array_sn,
+  array_hn,
+  day,
+  ts,
+  epo,
+
+  raw_model,
+  array_type,
+  array_series,
+  os_version,
+  config_info_day,
+
+  rrops,
+  rrmbps,
+  rwops,
+  rwmbps,
+  srops,
+  srmbps,
+  swops,
+  swmbps,
+  kbpr,
+  kbpw,
+
+  iops,
+  ns_read_ops_pct,
+  seq_read_ops_pct,
+  ns_write_ops_pct,
+  seq_write_ops_pct,
+  mbps,
+  ns_read_mbps_pct,
+  seq_read_mbps_pct,
+  ns_write_mbps_pct,
+  seq_write_mbps_pct,
+
+  full_rlat_ms,
+  full_wlat_ms,
+  red_rlat_pct,
+  red_wlat_pct,
+  ds_rlat_pct,
+  ds_wlat_pct,
+  queue_rlat_pct,
+  queue_wlat_pct,
+  internal_qos_rlat_pct,
+  internal_qos_wlat_pct,
+
+  io_red_delay_pct,
+  io_red_pct,
+
+  ioRedDelayTime,
+  ioRedDelayCount,
+  ioRedDelayMaxed,
+  ioRedCount,
+  ioRedDropCount,
+  ioRedStageCount,
+
+  cpu_busy_pct,
+
+  total_alloc_cpu_busy_pct,
+
+  cpu_pct_Autogen,
+  cpu_pct_BgJobs,
+  cpu_pct_BinMig,
+  cpu_pct_CISync,
+  cpu_pct_Ckpt,
+  cpu_pct_CpOffload,
+  cpu_pct_DGc,
+  cpu_pct_DISync,
+  cpu_pct_DbbSync,
+  cpu_pct_Del,
+  cpu_pct_Dsdm,
+  cpu_pct_FGc,
+  cpu_pct_FISync,
+  cpu_pct_FgHiPrio,
+  cpu_pct_FgIo,
+  cpu_pct_Gc,
+  cpu_pct_HiPrio,
+  cpu_pct_Idle,
+  cpu_pct_Io,
+  cpu_pct_Mirror,
+  cpu_pct_Misc,
+  cpu_pct_Pin,
+  cpu_pct_RaidResync,
+  cpu_pct_Repl,
+  cpu_pct_SysHiPrio,
+  --SYNC REP SENSORS
+  cpu_pct_DISyncBlack,
+  cpu_pct_DISyncWhite,
+  cpu_pct_SyncRep,
+  disk_io_pct_SyncRep,
+  snapReplRxBlocks,
+  snapReplRxDataBytes,
+  snapReplTxBlocks,
+  snapReplTxDataBytes,
+  syncReplRxBlocks,
+  syncReplRxDataBytes,
+  syncReplTxBlocks,
+  syncReplTxDataBytes,
+  syncReplTotalMsec,
+  syncReplTxOps,
+  sync_repl_downstream_ds_wlat_pct,
+  sync_repl_upstream_network_ds_wlat_pct,
+  sync_repl_upstream_wait_ds_wlat_pct,
+  sync_repl_downstream_wlat_pct,
+  sync_repl_upstream_network_wlat_pct,
+  sync_repl_upstream_wait_wlat_pct,
+  vmSrepResyncDataRxBytes,
+  vmSrepResyncDataTxBytes,
+  vmSrepResyncDataTxOpFailures,
+  vmSrepResyncDataTxOpRetries,
+  partner_out_of_sync_11031,
+  partner_in_sync_11032,
+  some_volcoll_out_of_sync_11033,
+  volcoll_in_sync_11034,
+
+  sub_cpu_pct_BiAutogen,
+  sub_cpu_pct_DiAutogen,
+
+  schedCpuCycleMax,
+  schedDiskIoTotal,
+
+  disk_io_pct_Autogen,
+  disk_io_pct_BgJobs,
+  disk_io_pct_BinMig,
+  disk_io_pct_CISync,
+  disk_io_pct_Ckpt,
+  disk_io_pct_CpOffload,
+  disk_io_pct_DGc,
+  disk_io_pct_DISync,
+  disk_io_pct_DbbSync,
+  disk_io_pct_Del,
+  disk_io_pct_FISync,
+  disk_io_pct_FgHiPrio,
+  disk_io_pct_FgIo,
+  disk_io_pct_Misc,
+  disk_io_pct_Pin,
+  disk_io_pct_RaidResync,
+  disk_io_pct_Repl,
+  disk_io_pct_SysHiPrio,
+
+  ns_ssd_miss_pct,
+  seq_ssd_miss_pct,
+  hdd_skip_pct,
+
+  cache_bi_miss_pct,
+  cache_di_miss_pct,
+  cache_fi_miss_pct,
+  write_skip_cache_pct,
+  rmiss_skip_cache_pct,
+  total_skip_cache_pct,
+
+  ssd_count,
+  avg_ssd_r_mbps,
+  avg_ssd_w_mbps,
+  avg_ssd_mbps,
+  max_ssd_r_mbps,
+  max_ssd_w_mbps,
+  max_ssd_mbps,
+  avg_ssd_r_ops,
+  avg_ssd_w_ops,
+  avg_ssd_ops,
+  max_ssd_r_ops,
+  max_ssd_w_ops,
+  max_ssd_ops,
+  avg_ssd_busy_pct,
+  max_ssd_busy_pct,
+  avg_ssd_r_lat_ms,
+  avg_ssd_w_lat_ms,
+  avg_ssd_lat_ms,
+  max_ssd_r_lat_ms,
+  max_ssd_w_lat_ms,
+  max_ssd_lat_ms,
+  avg_ssd_r_queue_depth_llaw,
+  avg_ssd_w_queue_depth_llaw,
+  avg_ssd_queue_depth_llaw,
+  max_ssd_r_queue_depth_llaw,
+  max_ssd_w_queue_depth_llaw,
+  max_ssd_queue_depth_llaw,
+
+  hdd_count,
+  avg_hdd_r_mbps,
+  avg_hdd_w_mbps,
+  avg_hdd_mbps,
+  max_hdd_r_mbps,
+  max_hdd_w_mbps,
+  max_hdd_mbps,
+  avg_hdd_r_ops,
+  avg_hdd_w_ops,
+  avg_hdd_ops,
+  max_hdd_r_ops,
+  max_hdd_w_ops,
+  max_hdd_ops,
+  avg_hdd_busy_pct,
+  max_hdd_busy_pct,
+  avg_hdd_r_lat_ms,
+  avg_hdd_w_lat_ms,
+  avg_hdd_lat_ms,
+  max_hdd_r_lat_ms,
+  max_hdd_w_lat_ms,
+  max_hdd_lat_ms,
+  avg_hdd_r_queue_depth_llaw,
+  avg_hdd_w_queue_depth_llaw,
+  avg_hdd_queue_depth_llaw,
+  max_hdd_r_queue_depth_llaw,
+  max_hdd_w_queue_depth_llaw,
+  max_hdd_queue_depth_llaw,
+
+  unalign_underlay_ct,
+  unalign_underlay_pause_ct,
+  underlay_pct_of_io,
+  underlay_pause_pct_of_io,
+  unalign_fixable_pct,
+  unalign_unfixable_pct,
+  unalign_maybe_fixable_pct,
+  unalign_offset_pct,
+  unalign_length_pct,
+  unalign_case1_pct,
+  unalign_case2_pct,
+  unalign_case3_pct,
+  unalign_case4_pct,
+  unalign_case5_pct,
+
+  net_inerr_pct,
+  net_retrans_pct,
+  net_inerr_ct,
+  net_retrans_ct,
+  net_inseg_ct,
+  net_outseg_ct,
+
+  unmapZeroCount,
+  unmapZeroBlocks,
+  unmapWriteSameCount,
+  unmapWriteSameBlocks,
+  unmapRequestCount,
+  unmapRequestBlocks,
+
+  replRxBlocks,
+  replRxDataBytes,
+  replTxBlocks,
+  replTxDataBytes,
+
+  xcopyRequestCount,
+  xcopyBlocksCopied,
+  xcopyRequestTime, --can calculate xcopy request latency from this
+
+  odxReadRequestCount,
+  odxReadBlocks,
+  odxReadTime,
+  odxReadPartial,
+  odxWriteRequestCount,
+  odxWriteBlocks,
+  odxWriteTime,
+  odxWritePartial,
+
+  dedupeBlockCount, --from this calculate the proportion of blocks being in burst mode and the deduplication rate of the incoming data
+  dedupeBurstBlockCount,
+  dedupeZeroCount,
+  dedupeableTotalBlocks,
+  dedupeBurstDdupUesBlockCount,
+  dedupeBurstFiNvpgBlockCount,
+  dedupeBurstFiUbSzBlockCount,
+  dedupeBurstLowFlashBlockCount,
+
+  writeAdmitThrottleCount,
+  writeAdmitThrottleTime, --need to know the difference between the write and remote writa and how to determine the proportion of the latency that is due to throttling
+  readAdmitThrottleCount,
+  readAdmitThrottleTime,
+  remoteWriteAdmitThrottleCount,
+  remoteWriteAdmitThrottleTime,
+
+  readAdmitCloseWindowCount,
+  readAdmitForceCloseWindowCount,
+  readAdmitForceOpenWindowCount,
+  readAdmitOpenWindowCount,
+  writeAdmitCloseWindowCount,
+  writeAdmitForceCloseWindowCount,
+  writeAdmitForceOpenWindowCount,
+  writeAdmitOpenWindowCount,
+  remoteWriteAdmitCloseWindowCount,
+  remoteWriteAdmitForceCloseWindowCount,
+  remoteWriteAdmitForceOpenWindowCount,
+  remoteWriteAdmitOpenWindowCount,
+
+  dGcRedEntry,
+  dGcRedExit,
+  fGcRedEntry,
+  fGcRedExit,
+  dGcBytesReapedRED,
+  dGcNumBlkReapedRED,
+  fGcBytesReapedRED,
+  fGcNumBlkReapedRED,
+  busBiFlashWriteRed,
+  busBiRmissFlashRed,
+  busDataFlashWriteRed,
+  busDataRmissFlashRed,
+  busDiFlashWriteRed,
+  busDiRmissFlashRed,
+  busFiFlashWriteRed,
+  busFiRmissFlashRed,
+  busPinnedDataFlashWriteRed,
+  cacheRedCiCount,
+  cacheRedDataCount,
+  cacheRedDiBiCount,
+
+  ioThrottleCount, --general rules for distinguishing between throttling (user created or imposed by background tasks)
+  ioThrottleTime,
+
+  cacheMemLeakTagged,
+  cacheMemLeakReachable,
+  cacheMemLeakDetected,
+  cacheMemLeakHighRefCnt,
+  cacheMemLeakFreed,
+  cacheMemLeakWait,
+  cacheMemLeakCheck,
+  cacheMemLeakCheckStarted,
+
+  numIopsLimitThrottleCnt, --ensure that if this is at the folder or volume level that the throttling will still be captured here
+  numMbpsLimitThrottleCnt,
+  iopsLimitThrottleCycles,
+  mbpsLimitThrottleCycles,
+
+  volume_count,
+  online_volume_count,
+  caching_volume_count,
+  aggressively_caching_volume_count,
+  pinned_volume_count,
+  deduping_volume_count,
+  iops_limit_volume_count,
+  mbps_limit_volume_count,
+  readsVolume,
+  writesVolume,
+  readBytesVolume,
+  writeBytesVolume,
+  encrypted_reads_pct,
+  encrypted_writes_pct,
+  encrypted_readBytes_pct,
+  encrypted_writeBytes_pct,
+  deduping_reads_pct,
+  deduping_writes_pct,
+  deduping_readBytes_pct,
+  deduping_writeBytes_pct,
+  ns_read_from_cached_volumes_pct,
+  seq_read_from_cached_volumes_pct,
+  ns_read_from_aggressively_cached_volumes_pct,
+  seq_read_from_aggressively_cached_volumes_pct,
+  ns_read_from_pinned_volumes_pct,
+  seq_read_from_pinned_volumes_pct,
+  ns_ssd_miss_from_cached_volumes_pct,
+  seq_ssd_miss_from_cached_volumes_pct,
+  ns_ssd_miss_from_aggressively_cached_volumes_pct,
+  seq_ssd_miss_from_aggressively_cached_volumes_pct,
+  ns_ssd_miss_from_pinned_volumes_pct,
+  seq_ssd_miss_from_pinned_volumes_pct,
+  ns_mem_miss_from_cached_volumes_pct,
+  seq_mem_miss_from_cached_volumes_pct,
+  ns_mem_miss_from_aggressively_cached_volumes_pct,
+  seq_mem_miss_from_aggressively_cached_volumes_pct,
+  ns_mem_miss_from_pinned_volumes_pct,
+  seq_mem_miss_from_pinned_volumes_pct,
+  writes_to_deduping_volumes_with_lt_5pct_dedupe_pct,
+  writes_to_deduping_volumes_with_lt_2pct_dedupe_pct,
+  writes_to_deduping_volumes_with_lt_1pct_dedupe_pct,
+  writes_to_deduping_volumes_with_0pct_dedupe_pct,
+  volume_count_1pct_compression,
+  volume_writes_uncompressible_pct,
+  volume_reads_uncompressible_pct,
+  volume_usage_uncompressible_pct,
+  volume_io_with_5pct_unaligment_pct,
+  volume_io_with_10pct_unaligment_pct,
+  volume_io_with_20pct_unaligment_pct,
+  volume_io_with_50pct_unaligment_pct,
+  volume_io_with_80pct_unaligment_pct,
+  volume_io_with_90pct_unaligment_pct,
+  volume_io_with_95pct_unaligment_pct,
+  iops_limit_iops_throttle_pct,
+  mbps_limit_mbps_throttle_pct,
+  iops_limit_cycle_throttle_pct,
+  mbps_limit_cycle_throttle_pct,
+  system_iops_limit_iops_throttle_pct,
+  system_mbps_limit_mbps_throttle_pct,
+  system_iops_limit_cycle_throttle_pct,
+  system_mbps_limit_cycle_throttle_pct,
+  folder_iops_limit_iops_throttle_pct,
+  folder_mbps_limit_mbps_throttle_pct,
+  folder_iops_limit_cycle_throttle_pct,
+  folder_mbps_limit_cycle_throttle_pct,
+  volume_iops_limit_iops_throttle_pct,
+  volume_mbps_limit_mbps_throttle_pct,
+  volume_iops_limit_cycle_throttle_pct,
+  volume_mbps_limit_cycle_throttle_pct,
+  volume_alloc_cpu_busy_pct,
+  ns_mem_miss_pct,
+  seq_mem_miss_pct,
+
+  fUnpinnedData_frxn,
+  fCi_frxn,
+  fBiDi_frxn,
+  fPinnedData_frxn,
+  fClaimed_frxn,
+  fUnclaimed_frxn,
+  fAvailForData_frxn,
+  fAvailForUnpinnedData_frxn,
+  dData_frxn,
+  dDisktop_frxn,
+  dDi_frxn,
+  dBi_frxn,
+  dHeatmap_frxn,
+  dFi_frxn,
+  dFd_frxn,
+  dClaimed_frxn,
+  dUnclaimed_frxn,
+
+
+  redPctGc,
+  redPctFlashGcUe,
+  redPctDiUe,
+  dGcPctLiveLogical,
+  dGcPctLiveDi,
+  ueNumDiDeletions,
+  ueNumDi,
+  uePctDi,
+  vmNumPendingGenDels,
+
+  schedCpuWeightAutogen,
+  schedCpuWeightCISync,
+  schedCpuWeightDbbSync,
+  schedCpuWeightDel,
+  schedCpuWeightDGc,
+  schedCpuWeightDISync,
+  schedCpuWeightFGc,
+  schedCpuWeightFISync,
+  schedCpuWeightPin,
+  schedDiskWeightAutogen,
+  schedDiskWeightCISync,
+  schedDiskWeightDbbSync,
+  schedDiskWeightDel,
+  schedDiskWeightDGc,
+  schedDiskWeightDISync,
+  schedDiskWeightFISync,
+  schedDiskWeightPin,
+  fi_size_gb,
+
+  --peercoral and new classifiers sensors
+  cpuQueueAvgSize,
+  schedQueueSizeDbbSync,
+  schedCpuQueueSizeDbbSync,
+  schedCpuQueueSizeFgIo,
+  atmItdCpuSaturatedCnt,
+  dbbSyncBytes,
+  cacheDataMiss,
+  dGcNumSegAlloc,
+  txnCommitLatCpu,
+  txnCommitPage,
+  iscsiReadTxqLat,
+  iscsiWriteTxqLat,
+  scsiWriteSubmitTime,
+  cacheFiHitMem,
+  cacheFiMiss,
+  cacheAddFiNode,
+  pgPctNv,
+
+--latency severity score calculations
+perf_sev_score("nsNumReadS512B-1k","nsNumReadS1k-2k","nsNumReadS2k-4k","nsNumReadS4k-8k","nsNumReadS8k-16k","nsNumReadS16k-32k","nsNumReadS32k-64k","nsNumReadS64k-128k","nsNumReadS128k-256k","nsNumReadS256k-512k","nsNumReadS512k-max","nsTimeReadS512B-1k","nsTimeReadS1k-2k","nsTimeReadS2k-4k","nsTimeReadS4k-8k","nsTimeReadS8k-16k","nsTimeReadS16k-32k","nsTimeReadS32k-64k","nsTimeReadS64k-128k","nsTimeReadS128k-256k","nsTimeReadS256k-512k","nsTimeReadS512k-max"
+      USING PARAMETERS op_type = 'nsRead', array_type = 'AFA', time_grain = 'hour') AS perf_sev_ns_read,
+perf_sev_score("seqNumReadS512B-1k","seqNumReadS1k-2k","seqNumReadS2k-4k","seqNumReadS4k-8k","seqNumReadS8k-16k","seqNumReadS16k-32k","seqNumReadS32k-64k","seqNumReadS64k-128k","seqNumReadS128k-256k","seqNumReadS256k-512k","seqNumReadS512k-max","seqTimeReadS512B-1k","seqTimeReadS1k-2k","seqTimeReadS2k-4k","seqTimeReadS4k-8k","seqTimeReadS8k-16k","seqTimeReadS16k-32k","seqTimeReadS32k-64k","seqTimeReadS64k-128k","seqTimeReadS128k-256k","seqTimeReadS256k-512k","seqTimeReadS512k-max"
+      USING PARAMETERS op_type = 'seqRead', array_type = 'AFA', time_grain = 'hour') AS perf_sev_seq_read,
+perf_sev_score("numWriteS512B-1k","numWriteS1k-2k","numWriteS2k-4k","numWriteS4k-8k","numWriteS8k-16k","numWriteS16k-32k","numWriteS32k-64k","numWriteS64k-128k","numWriteS128k-256k","numWriteS256k-512k","numWriteS512k-max","timeWriteS512B-1k","timeWriteS1k-2k","timeWriteS2k-4k","timeWriteS4k-8k","timeWriteS8k-16k","timeWriteS16k-32k","timeWriteS32k-64k","timeWriteS64k-128k","timeWriteS128k-256k","timeWriteS256k-512k","timeWriteS512k-max"
+      USING PARAMETERS op_type = 'write', array_type = 'AFA', time_grain = 'hour') AS perf_sev_write,
+--resource headroom models
+(rrops+srops)*e.read_iops_coeff + (rwops+swops)*e.write_iops_coeff + (rrmbps+srmbps)*1024*e.read_kbps_coeff + (rwmbps+swmbps)*1024*e.write_kbps_coeff as cpu_headroom_model_engineering,
+(rrops+srops)*i.read_iops_coeff + (rwops+swops)*i.write_iops_coeff + (rrmbps+srmbps)*1024*i.read_kbps_coeff + (rwmbps+swmbps)*1024*i.write_kbps_coeff as cpu_headroom_model_installbase,
+(100*cpu_busy_pct)*ZEROIFNULL(1/NULLIFZERO((rrops+srops)*e.read_iops_coeff + (rwops+swops)*e.write_iops_coeff + (rrmbps+srmbps)*1024*e.read_kbps_coeff + (rwmbps+swmbps)*1024*e.write_kbps_coeff)) as cpu_model_pct_of_actual_engineering,
+(100*cpu_busy_pct)*ZEROIFNULL(1/NULLIFZERO((rrops+srops)*i.read_iops_coeff + (rwops+swops)*i.write_iops_coeff + (rrmbps+srmbps)*1024*i.read_kbps_coeff + (rwmbps+swmbps)*1024*i.write_kbps_coeff)) as cpu_model_pct_of_actual_installbase,
+(cpu_busy_pct) - ((rrops+srops)*e.read_iops_coeff + (rwops+swops)*e.write_iops_coeff + (rrmbps+srmbps)*1024*e.read_kbps_coeff + (rwmbps+swmbps)*1024*e.write_kbps_coeff) as cpu_model_diff_of_actual_engineering,
+(cpu_busy_pct) - ((rrops+srops)*i.read_iops_coeff + (rwops+swops)*i.write_iops_coeff + (rrmbps+srmbps)*1024*i.read_kbps_coeff + (rwmbps+swmbps)*1024*i.write_kbps_coeff) as cpu_model_diff_of_actual_installbase
+from array_lvl_perf_joined_without_duplicates j
+left outer join (select * from reference0.io_headroom_pct_by_system where (source is null or source = 'engineering') and (coalesce(all_flash,true) = coalesce(deduplication_enabled,true))) e on e.system = array_series
+left outer join (select * from reference0.io_headroom_pct_by_system where (source is null or source = 'infosight')   and (coalesce(all_flash,true) = coalesce(deduplication_enabled,true))) i on i.system = array_series
+where array_type = 'AFA';
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+drop table if exists array_lvl_latency_severity_and_sizing_hfa_minute;
+create local temp table array_lvl_latency_severity_and_sizing_hfa_minute on commit preserve rows as select
+  array_sn,
+  array_hn,
+  day,
+  ts,
+  epo,
+
+  raw_model,
+  array_type,
+  array_series,
+  os_version,
+  config_info_day,
+
+  rrops,
+  rrmbps,
+  rwops,
+  rwmbps,
+  srops,
+  srmbps,
+  swops,
+  swmbps,
+  kbpr,
+  kbpw,
+
+  iops,
+  ns_read_ops_pct,
+  seq_read_ops_pct,
+  ns_write_ops_pct,
+  seq_write_ops_pct,
+  mbps,
+  ns_read_mbps_pct,
+  seq_read_mbps_pct,
+  ns_write_mbps_pct,
+  seq_write_mbps_pct,
+
+  full_rlat_ms,
+  full_wlat_ms,
+  red_rlat_pct,
+  red_wlat_pct,
+  ds_rlat_pct,
+  ds_wlat_pct,
+  queue_rlat_pct,
+  queue_wlat_pct,
+  internal_qos_rlat_pct,
+  internal_qos_wlat_pct,
+
+  io_red_delay_pct,
+  io_red_pct,
+
+  ioRedDelayTime,
+  ioRedDelayCount,
+  ioRedDelayMaxed,
+  ioRedCount,
+  ioRedDropCount,
+  ioRedStageCount,
+
+  cpu_busy_pct,
+
+  total_alloc_cpu_busy_pct,
+
+  cpu_pct_Autogen,
+  cpu_pct_BgJobs,
+  cpu_pct_BinMig,
+  cpu_pct_CISync,
+  cpu_pct_Ckpt,
+  cpu_pct_CpOffload,
+  cpu_pct_DGc,
+  cpu_pct_DISync,
+  cpu_pct_DbbSync,
+  cpu_pct_Del,
+  cpu_pct_Dsdm,
+  cpu_pct_FGc,
+  cpu_pct_FISync,
+  cpu_pct_FgHiPrio,
+  cpu_pct_FgIo,
+  cpu_pct_Gc,
+  cpu_pct_HiPrio,
+  cpu_pct_Idle,
+  cpu_pct_Io,
+  cpu_pct_Mirror,
+  cpu_pct_Misc,
+  cpu_pct_Pin,
+  cpu_pct_RaidResync,
+  cpu_pct_Repl,
+  cpu_pct_SysHiPrio,
+  --SYNC REP SENSORS
+  cpu_pct_DISyncBlack,
+  cpu_pct_DISyncWhite,
+  cpu_pct_SyncRep,
+  disk_io_pct_SyncRep,
+  snapReplRxBlocks,
+  snapReplRxDataBytes,
+  snapReplTxBlocks,
+  snapReplTxDataBytes,
+  syncReplRxBlocks,
+  syncReplRxDataBytes,
+  syncReplTxBlocks,
+  syncReplTxDataBytes,
+  syncReplTotalMsec,
+  syncReplTxOps,
+  sync_repl_downstream_ds_wlat_pct,
+  sync_repl_upstream_network_ds_wlat_pct,
+  sync_repl_upstream_wait_ds_wlat_pct,
+  sync_repl_downstream_wlat_pct,
+  sync_repl_upstream_network_wlat_pct,
+  sync_repl_upstream_wait_wlat_pct,
+  vmSrepResyncDataRxBytes,
+  vmSrepResyncDataTxBytes,
+  vmSrepResyncDataTxOpFailures,
+  vmSrepResyncDataTxOpRetries,
+  partner_out_of_sync_11031,
+  partner_in_sync_11032,
+  some_volcoll_out_of_sync_11033,
+  volcoll_in_sync_11034,
+
+  sub_cpu_pct_BiAutogen,
+  sub_cpu_pct_DiAutogen,
+
+  schedCpuCycleMax,
+  schedDiskIoTotal,
+
+  disk_io_pct_Autogen,
+  disk_io_pct_BgJobs,
+  disk_io_pct_BinMig,
+  disk_io_pct_CISync,
+  disk_io_pct_Ckpt,
+  disk_io_pct_CpOffload,
+  disk_io_pct_DGc,
+  disk_io_pct_DISync,
+  disk_io_pct_DbbSync,
+  disk_io_pct_Del,
+  disk_io_pct_FISync,
+  disk_io_pct_FgHiPrio,
+  disk_io_pct_FgIo,
+  disk_io_pct_Misc,
+  disk_io_pct_Pin,
+  disk_io_pct_RaidResync,
+  disk_io_pct_Repl,
+  disk_io_pct_SysHiPrio,
+
+  ns_ssd_miss_pct,
+  seq_ssd_miss_pct,
+  hdd_skip_pct,
+
+  cache_bi_miss_pct,
+  cache_di_miss_pct,
+  cache_fi_miss_pct,
+  write_skip_cache_pct,
+  rmiss_skip_cache_pct,
+  total_skip_cache_pct,
+
+  ssd_count,
+  avg_ssd_r_mbps,
+  avg_ssd_w_mbps,
+  avg_ssd_mbps,
+  max_ssd_r_mbps,
+  max_ssd_w_mbps,
+  max_ssd_mbps,
+  avg_ssd_r_ops,
+  avg_ssd_w_ops,
+  avg_ssd_ops,
+  max_ssd_r_ops,
+  max_ssd_w_ops,
+  max_ssd_ops,
+  avg_ssd_busy_pct,
+  max_ssd_busy_pct,
+  avg_ssd_r_lat_ms,
+  avg_ssd_w_lat_ms,
+  avg_ssd_lat_ms,
+  max_ssd_r_lat_ms,
+  max_ssd_w_lat_ms,
+  max_ssd_lat_ms,
+  avg_ssd_r_queue_depth_llaw,
+  avg_ssd_w_queue_depth_llaw,
+  avg_ssd_queue_depth_llaw,
+  max_ssd_r_queue_depth_llaw,
+  max_ssd_w_queue_depth_llaw,
+  max_ssd_queue_depth_llaw,
+
+  hdd_count,
+  avg_hdd_r_mbps,
+  avg_hdd_w_mbps,
+  avg_hdd_mbps,
+  max_hdd_r_mbps,
+  max_hdd_w_mbps,
+  max_hdd_mbps,
+  avg_hdd_r_ops,
+  avg_hdd_w_ops,
+  avg_hdd_ops,
+  max_hdd_r_ops,
+  max_hdd_w_ops,
+  max_hdd_ops,
+  avg_hdd_busy_pct,
+  max_hdd_busy_pct,
+  avg_hdd_r_lat_ms,
+  avg_hdd_w_lat_ms,
+  avg_hdd_lat_ms,
+  max_hdd_r_lat_ms,
+  max_hdd_w_lat_ms,
+  max_hdd_lat_ms,
+  avg_hdd_r_queue_depth_llaw,
+  avg_hdd_w_queue_depth_llaw,
+  avg_hdd_queue_depth_llaw,
+  max_hdd_r_queue_depth_llaw,
+  max_hdd_w_queue_depth_llaw,
+  max_hdd_queue_depth_llaw,
+
+  unalign_underlay_ct,
+  unalign_underlay_pause_ct,
+  underlay_pct_of_io,
+  underlay_pause_pct_of_io,
+  unalign_fixable_pct,
+  unalign_unfixable_pct,
+  unalign_maybe_fixable_pct,
+  unalign_offset_pct,
+  unalign_length_pct,
+  unalign_case1_pct,
+  unalign_case2_pct,
+  unalign_case3_pct,
+  unalign_case4_pct,
+  unalign_case5_pct,
+
+  net_inerr_pct,
+  net_retrans_pct,
+  net_inerr_ct,
+  net_retrans_ct,
+  net_inseg_ct,
+  net_outseg_ct,
+
+  unmapZeroCount,
+  unmapZeroBlocks,
+  unmapWriteSameCount,
+  unmapWriteSameBlocks,
+  unmapRequestCount,
+  unmapRequestBlocks,
+
+  replRxBlocks,
+  replRxDataBytes,
+  replTxBlocks,
+  replTxDataBytes,
+
+  xcopyRequestCount,
+  xcopyBlocksCopied,
+  xcopyRequestTime, --can calculate xcopy request latency from this
+
+  odxReadRequestCount,
+  odxReadBlocks,
+  odxReadTime,
+  odxReadPartial,
+  odxWriteRequestCount,
+  odxWriteBlocks,
+  odxWriteTime,
+  odxWritePartial,
+
+  dedupeBlockCount, --from this calculate the proportion of blocks being in burst mode and the deduplication rate of the incoming data
+  dedupeBurstBlockCount,
+  dedupeZeroCount,
+  dedupeableTotalBlocks,
+  dedupeBurstDdupUesBlockCount,
+  dedupeBurstFiNvpgBlockCount,
+  dedupeBurstFiUbSzBlockCount,
+  dedupeBurstLowFlashBlockCount,
+
+  writeAdmitThrottleCount,
+  writeAdmitThrottleTime, --need to know the difference between the write and remote writa and how to determine the proportion of the latency that is due to throttling
+  readAdmitThrottleCount,
+  readAdmitThrottleTime,
+  remoteWriteAdmitThrottleCount,
+  remoteWriteAdmitThrottleTime,
+
+  readAdmitCloseWindowCount,
+  readAdmitForceCloseWindowCount,
+  readAdmitForceOpenWindowCount,
+  readAdmitOpenWindowCount,
+  writeAdmitCloseWindowCount,
+  writeAdmitForceCloseWindowCount,
+  writeAdmitForceOpenWindowCount,
+  writeAdmitOpenWindowCount,
+  remoteWriteAdmitCloseWindowCount,
+  remoteWriteAdmitForceCloseWindowCount,
+  remoteWriteAdmitForceOpenWindowCount,
+  remoteWriteAdmitOpenWindowCount,
+
+  dGcRedEntry,
+  dGcRedExit,
+  fGcRedEntry,
+  fGcRedExit,
+  dGcBytesReapedRED,
+  dGcNumBlkReapedRED,
+  fGcBytesReapedRED,
+  fGcNumBlkReapedRED,
+  busBiFlashWriteRed,
+  busBiRmissFlashRed,
+  busDataFlashWriteRed,
+  busDataRmissFlashRed,
+  busDiFlashWriteRed,
+  busDiRmissFlashRed,
+  busFiFlashWriteRed,
+  busFiRmissFlashRed,
+  busPinnedDataFlashWriteRed,
+  cacheRedCiCount,
+  cacheRedDataCount,
+  cacheRedDiBiCount,
+
+  ioThrottleCount, --general rules for distinguishing between throttling (user created or imposed by background tasks)
+  ioThrottleTime,
+
+  cacheMemLeakTagged,
+  cacheMemLeakReachable,
+  cacheMemLeakDetected,
+  cacheMemLeakHighRefCnt,
+  cacheMemLeakFreed,
+  cacheMemLeakWait,
+  cacheMemLeakCheck,
+  cacheMemLeakCheckStarted,
+
+  numIopsLimitThrottleCnt, --ensure that if this is at the folder or volume level that the throttling will still be captured here
+  numMbpsLimitThrottleCnt,
+  iopsLimitThrottleCycles,
+  mbpsLimitThrottleCycles,
+
+  volume_count,
+  online_volume_count,
+  caching_volume_count,
+  aggressively_caching_volume_count,
+  pinned_volume_count,
+  deduping_volume_count,
+  iops_limit_volume_count,
+  mbps_limit_volume_count,
+  readsVolume,
+  writesVolume,
+  readBytesVolume,
+  writeBytesVolume,
+  encrypted_reads_pct,
+  encrypted_writes_pct,
+  encrypted_readBytes_pct,
+  encrypted_writeBytes_pct,
+  deduping_reads_pct,
+  deduping_writes_pct,
+  deduping_readBytes_pct,
+  deduping_writeBytes_pct,
+  ns_read_from_cached_volumes_pct,
+  seq_read_from_cached_volumes_pct,
+  ns_read_from_aggressively_cached_volumes_pct,
+  seq_read_from_aggressively_cached_volumes_pct,
+  ns_read_from_pinned_volumes_pct,
+  seq_read_from_pinned_volumes_pct,
+  ns_ssd_miss_from_cached_volumes_pct,
+  seq_ssd_miss_from_cached_volumes_pct,
+  ns_ssd_miss_from_aggressively_cached_volumes_pct,
+  seq_ssd_miss_from_aggressively_cached_volumes_pct,
+  ns_ssd_miss_from_pinned_volumes_pct,
+  seq_ssd_miss_from_pinned_volumes_pct,
+  ns_mem_miss_from_cached_volumes_pct,
+  seq_mem_miss_from_cached_volumes_pct,
+  ns_mem_miss_from_aggressively_cached_volumes_pct,
+  seq_mem_miss_from_aggressively_cached_volumes_pct,
+  ns_mem_miss_from_pinned_volumes_pct,
+  seq_mem_miss_from_pinned_volumes_pct,
+  writes_to_deduping_volumes_with_lt_5pct_dedupe_pct,
+  writes_to_deduping_volumes_with_lt_2pct_dedupe_pct,
+  writes_to_deduping_volumes_with_lt_1pct_dedupe_pct,
+  writes_to_deduping_volumes_with_0pct_dedupe_pct,
+  volume_count_1pct_compression,
+  volume_writes_uncompressible_pct,
+  volume_reads_uncompressible_pct,
+  volume_usage_uncompressible_pct,
+  volume_io_with_5pct_unaligment_pct,
+  volume_io_with_10pct_unaligment_pct,
+  volume_io_with_20pct_unaligment_pct,
+  volume_io_with_50pct_unaligment_pct,
+  volume_io_with_80pct_unaligment_pct,
+  volume_io_with_90pct_unaligment_pct,
+  volume_io_with_95pct_unaligment_pct,
+  iops_limit_iops_throttle_pct,
+  mbps_limit_mbps_throttle_pct,
+  iops_limit_cycle_throttle_pct,
+  mbps_limit_cycle_throttle_pct,
+  system_iops_limit_iops_throttle_pct,
+  system_mbps_limit_mbps_throttle_pct,
+  system_iops_limit_cycle_throttle_pct,
+  system_mbps_limit_cycle_throttle_pct,
+  folder_iops_limit_iops_throttle_pct,
+  folder_mbps_limit_mbps_throttle_pct,
+  folder_iops_limit_cycle_throttle_pct,
+  folder_mbps_limit_cycle_throttle_pct,
+  volume_iops_limit_iops_throttle_pct,
+  volume_mbps_limit_mbps_throttle_pct,
+  volume_iops_limit_cycle_throttle_pct,
+  volume_mbps_limit_cycle_throttle_pct,
+  volume_alloc_cpu_busy_pct,
+  ns_mem_miss_pct,
+  seq_mem_miss_pct,
+
+  fUnpinnedData_frxn,
+  fCi_frxn,
+  fBiDi_frxn,
+  fPinnedData_frxn,
+  fClaimed_frxn,
+  fUnclaimed_frxn,
+  fAvailForData_frxn,
+  fAvailForUnpinnedData_frxn,
+  dData_frxn,
+  dDisktop_frxn,
+  dDi_frxn,
+  dBi_frxn,
+  dHeatmap_frxn,
+  dFi_frxn,
+  dFd_frxn,
+  dClaimed_frxn,
+  dUnclaimed_frxn,
+
+
+  redPctGc,
+  redPctFlashGcUe,
+  redPctDiUe,
+  dGcPctLiveLogical,
+  dGcPctLiveDi,
+  ueNumDiDeletions,
+  ueNumDi,
+  uePctDi,
+  vmNumPendingGenDels,
+
+  schedCpuWeightAutogen,
+  schedCpuWeightCISync,
+  schedCpuWeightDbbSync,
+  schedCpuWeightDel,
+  schedCpuWeightDGc,
+  schedCpuWeightDISync,
+  schedCpuWeightFGc,
+  schedCpuWeightFISync,
+  schedCpuWeightPin,
+  schedDiskWeightAutogen,
+  schedDiskWeightCISync,
+  schedDiskWeightDbbSync,
+  schedDiskWeightDel,
+  schedDiskWeightDGc,
+  schedDiskWeightDISync,
+  schedDiskWeightFISync,
+  schedDiskWeightPin,
+  fi_size_gb,
+
+  --peercoral and new classifiers sensors
+  cpuQueueAvgSize,
+  schedQueueSizeDbbSync,
+  schedCpuQueueSizeDbbSync,
+  schedCpuQueueSizeFgIo,
+  atmItdCpuSaturatedCnt,
+  dbbSyncBytes,
+  cacheDataMiss,
+  dGcNumSegAlloc,
+  txnCommitLatCpu,
+  txnCommitPage,
+  iscsiReadTxqLat,
+  iscsiWriteTxqLat,
+  scsiWriteSubmitTime,
+  cacheFiHitMem,
+  cacheFiMiss,
+  cacheAddFiNode,
+  pgPctNv,
+
+--latency severity score calculations
+perf_sev_score("nsNumReadS512B-1k","nsNumReadS1k-2k","nsNumReadS2k-4k","nsNumReadS4k-8k","nsNumReadS8k-16k","nsNumReadS16k-32k","nsNumReadS32k-64k","nsNumReadS64k-128k","nsNumReadS128k-256k","nsNumReadS256k-512k","nsNumReadS512k-max","nsTimeReadS512B-1k","nsTimeReadS1k-2k","nsTimeReadS2k-4k","nsTimeReadS4k-8k","nsTimeReadS8k-16k","nsTimeReadS16k-32k","nsTimeReadS32k-64k","nsTimeReadS64k-128k","nsTimeReadS128k-256k","nsTimeReadS256k-512k","nsTimeReadS512k-max"
+      USING PARAMETERS op_type = 'nsRead', array_type = 'HFA', time_grain = 'minute') AS perf_sev_ns_read,
+perf_sev_score("seqNumReadS512B-1k","seqNumReadS1k-2k","seqNumReadS2k-4k","seqNumReadS4k-8k","seqNumReadS8k-16k","seqNumReadS16k-32k","seqNumReadS32k-64k","seqNumReadS64k-128k","seqNumReadS128k-256k","seqNumReadS256k-512k","seqNumReadS512k-max","seqTimeReadS512B-1k","seqTimeReadS1k-2k","seqTimeReadS2k-4k","seqTimeReadS4k-8k","seqTimeReadS8k-16k","seqTimeReadS16k-32k","seqTimeReadS32k-64k","seqTimeReadS64k-128k","seqTimeReadS128k-256k","seqTimeReadS256k-512k","seqTimeReadS512k-max"
+      USING PARAMETERS op_type = 'seqRead', array_type = 'HFA', time_grain = 'minute') AS perf_sev_seq_read,
+perf_sev_score("numWriteS512B-1k","numWriteS1k-2k","numWriteS2k-4k","numWriteS4k-8k","numWriteS8k-16k","numWriteS16k-32k","numWriteS32k-64k","numWriteS64k-128k","numWriteS128k-256k","numWriteS256k-512k","numWriteS512k-max","timeWriteS512B-1k","timeWriteS1k-2k","timeWriteS2k-4k","timeWriteS4k-8k","timeWriteS8k-16k","timeWriteS16k-32k","timeWriteS32k-64k","timeWriteS64k-128k","timeWriteS128k-256k","timeWriteS256k-512k","timeWriteS512k-max"
+      USING PARAMETERS op_type = 'write', array_type = 'HFA', time_grain = 'minute') AS perf_sev_write,
+--resource headroom models
+(rrops+srops)*e.read_iops_coeff + (rwops+swops)*e.write_iops_coeff + (rrmbps+srmbps)*1024*e.read_kbps_coeff + (rwmbps+swmbps)*1024*e.write_kbps_coeff as cpu_headroom_model_engineering,
+(rrops+srops)*i.read_iops_coeff + (rwops+swops)*i.write_iops_coeff + (rrmbps+srmbps)*1024*i.read_kbps_coeff + (rwmbps+swmbps)*1024*i.write_kbps_coeff as cpu_headroom_model_installbase,
+(100*cpu_busy_pct)*ZEROIFNULL(1/NULLIFZERO((rrops+srops)*e.read_iops_coeff + (rwops+swops)*e.write_iops_coeff + (rrmbps+srmbps)*1024*e.read_kbps_coeff + (rwmbps+swmbps)*1024*e.write_kbps_coeff)) as cpu_model_pct_of_actual_engineering,
+(100*cpu_busy_pct)*ZEROIFNULL(1/NULLIFZERO((rrops+srops)*i.read_iops_coeff + (rwops+swops)*i.write_iops_coeff + (rrmbps+srmbps)*1024*i.read_kbps_coeff + (rwmbps+swmbps)*1024*i.write_kbps_coeff)) as cpu_model_pct_of_actual_installbase,
+(cpu_busy_pct) - ((rrops+srops)*e.read_iops_coeff + (rwops+swops)*e.write_iops_coeff + (rrmbps+srmbps)*1024*e.read_kbps_coeff + (rwmbps+swmbps)*1024*e.write_kbps_coeff) as cpu_model_diff_of_actual_engineering,
+(cpu_busy_pct) - ((rrops+srops)*i.read_iops_coeff + (rwops+swops)*i.write_iops_coeff + (rrmbps+srmbps)*1024*i.read_kbps_coeff + (rwmbps+swmbps)*1024*i.write_kbps_coeff) as cpu_model_diff_of_actual_installbase
+from array_lvl_perf_joined_without_duplicates j
+left outer join (select * from reference0.io_headroom_pct_by_system where (source is null or source = 'engineering') and (coalesce(all_flash,true) = coalesce(deduplication_enabled,true))) e on e.system = array_series
+left outer join (select * from reference0.io_headroom_pct_by_system where (source is null or source = 'infosight')   and (coalesce(all_flash,true) = coalesce(deduplication_enabled,true))) i on i.system = array_series
+where array_type = 'HFA';
+
+select array_sn,ts,"nsNumReadS512B-1k","nsNumReadS1k-2k","nsNumReadS2k-4k","nsNumReadS4k-8k","nsNumReadS8k-16k","nsNumReadS16k-32k","nsNumReadS32k-64k","nsNumReadS64k-128k","nsNumReadS128k-256k","nsNumReadS256k-512k","nsNumReadS512k-max","nsTimeReadS512B-1k","nsTimeReadS1k-2k","nsTimeReadS2k-4k","nsTimeReadS4k-8k","nsTimeReadS8k-16k","nsTimeReadS16k-32k","nsTimeReadS32k-64k","nsTimeReadS64k-128k","nsTimeReadS128k-256k","nsTimeReadS256k-512k","nsTimeReadS512k-max"
+,"seqNumReadS512B-1k","seqNumReadS1k-2k","seqNumReadS2k-4k","seqNumReadS4k-8k","seqNumReadS8k-16k","seqNumReadS16k-32k","seqNumReadS32k-64k","seqNumReadS64k-128k","seqNumReadS128k-256k","seqNumReadS256k-512k","seqNumReadS512k-max","seqTimeReadS512B-1k","seqTimeReadS1k-2k","seqTimeReadS2k-4k","seqTimeReadS4k-8k","seqTimeReadS8k-16k","seqTimeReadS16k-32k","seqTimeReadS32k-64k","seqTimeReadS64k-128k","seqTimeReadS128k-256k","seqTimeReadS256k-512k","seqTimeReadS512k-max"
+,"numWriteS512B-1k","numWriteS1k-2k","numWriteS2k-4k","numWriteS4k-8k","numWriteS8k-16k","numWriteS16k-32k","numWriteS32k-64k","numWriteS64k-128k","numWriteS128k-256k","numWriteS256k-512k","numWriteS512k-max","timeWriteS512B-1k","timeWriteS1k-2k","timeWriteS2k-4k","timeWriteS4k-8k","timeWriteS8k-16k","timeWriteS16k-32k","timeWriteS32k-64k","timeWriteS64k-128k","timeWriteS128k-256k","timeWriteS256k-512k","timeWriteS512k-max"
+from array_lvl_perf_joined_without_duplicates limit 10;
+
+select * from array_lvl_perf_joined_without_duplicates limit 1;
+select * from array_lvl_latency_severity_and_sizing_hfa limit 20;
+select * from array_lvl_latency_severity_and_sizing_hfa_minute limit 20;
+
+
+select * from comp limit 10;
+
+
+drop table if exists comp;
+create local temp table comp on commit preserve rows as
+select
+  array_sn,
+  array_hn,
+  day,
+  ts,
+  epo,
+
+  raw_model,
+  array_type,
+  array_series,
+  os_version,
+  config_info_day,
+
+  rrops,
+  rrmbps,
+  rwops,
+  rwmbps,
+  srops,
+  srmbps,
+  swops,
+  swmbps,
+  kbpr,
+  kbpw,
+
+  iops,
+  ns_read_ops_pct,
+  seq_read_ops_pct,
+  ns_write_ops_pct,
+  seq_write_ops_pct,
+  mbps,
+  ns_read_mbps_pct,
+  seq_read_mbps_pct,
+  ns_write_mbps_pct,
+  seq_write_mbps_pct,
+
+  full_rlat_ms,
+  full_wlat_ms,
+  red_rlat_pct,
+  red_wlat_pct,
+  ds_rlat_pct,
+  ds_wlat_pct,
+  queue_rlat_pct,
+  queue_wlat_pct,
+  internal_qos_rlat_pct,
+  internal_qos_wlat_pct,
+
+  io_red_delay_pct,
+  io_red_pct,
+
+  ioRedDelayTime,
+  ioRedDelayCount,
+  ioRedDelayMaxed,
+  ioRedCount,
+  ioRedDropCount,
+  ioRedStageCount,
+
+  cpu_busy_pct,
+
+  total_alloc_cpu_busy_pct,
+
+  cpu_pct_Autogen,
+  cpu_pct_BgJobs,
+  cpu_pct_BinMig,
+  cpu_pct_CISync,
+  cpu_pct_Ckpt,
+  cpu_pct_CpOffload,
+  cpu_pct_DGc,
+  cpu_pct_DISync,
+  cpu_pct_DbbSync,
+  cpu_pct_Del,
+  cpu_pct_Dsdm,
+  cpu_pct_FGc,
+  cpu_pct_FISync,
+  cpu_pct_FgHiPrio,
+  cpu_pct_FgIo,
+  cpu_pct_Gc,
+  cpu_pct_HiPrio,
+  cpu_pct_Idle,
+  cpu_pct_Io,
+  cpu_pct_Mirror,
+  cpu_pct_Misc,
+  cpu_pct_Pin,
+  cpu_pct_RaidResync,
+  cpu_pct_Repl,
+  cpu_pct_SysHiPrio,
+  --SYNC REP SENSORS
+  cpu_pct_DISyncBlack,
+  cpu_pct_DISyncWhite,
+  cpu_pct_SyncRep,
+  disk_io_pct_SyncRep,
+  snapReplRxBlocks,
+  snapReplRxDataBytes,
+  snapReplTxBlocks,
+  snapReplTxDataBytes,
+  syncReplRxBlocks,
+  syncReplRxDataBytes,
+  syncReplTxBlocks,
+  syncReplTxDataBytes,
+  syncReplTotalMsec,
+  syncReplTxOps,
+  sync_repl_downstream_ds_wlat_pct,
+  sync_repl_upstream_network_ds_wlat_pct,
+  sync_repl_upstream_wait_ds_wlat_pct,
+  sync_repl_downstream_wlat_pct,
+  sync_repl_upstream_network_wlat_pct,
+  sync_repl_upstream_wait_wlat_pct,
+  vmSrepResyncDataRxBytes,
+  vmSrepResyncDataTxBytes,
+  vmSrepResyncDataTxOpFailures,
+  vmSrepResyncDataTxOpRetries,
+  partner_out_of_sync_11031,
+  partner_in_sync_11032,
+  some_volcoll_out_of_sync_11033,
+  volcoll_in_sync_11034,
+
+  sub_cpu_pct_BiAutogen,
+  sub_cpu_pct_DiAutogen,
+
+  schedCpuCycleMax,
+  schedDiskIoTotal,
+
+  disk_io_pct_Autogen,
+  disk_io_pct_BgJobs,
+  disk_io_pct_BinMig,
+  disk_io_pct_CISync,
+  disk_io_pct_Ckpt,
+  disk_io_pct_CpOffload,
+  disk_io_pct_DGc,
+  disk_io_pct_DISync,
+  disk_io_pct_DbbSync,
+  disk_io_pct_Del,
+  disk_io_pct_FISync,
+  disk_io_pct_FgHiPrio,
+  disk_io_pct_FgIo,
+  disk_io_pct_Misc,
+  disk_io_pct_Pin,
+  disk_io_pct_RaidResync,
+  disk_io_pct_Repl,
+  disk_io_pct_SysHiPrio,
+
+  ns_ssd_miss_pct,
+  seq_ssd_miss_pct,
+  hdd_skip_pct,
+
+  cache_bi_miss_pct,
+  cache_di_miss_pct,
+  cache_fi_miss_pct,
+  write_skip_cache_pct,
+  rmiss_skip_cache_pct,
+  total_skip_cache_pct,
+
+  ssd_count,
+  avg_ssd_r_mbps,
+  avg_ssd_w_mbps,
+  avg_ssd_mbps,
+  max_ssd_r_mbps,
+  max_ssd_w_mbps,
+  max_ssd_mbps,
+  avg_ssd_r_ops,
+  avg_ssd_w_ops,
+  avg_ssd_ops,
+  max_ssd_r_ops,
+  max_ssd_w_ops,
+  max_ssd_ops,
+  avg_ssd_busy_pct,
+  max_ssd_busy_pct,
+  avg_ssd_r_lat_ms,
+  avg_ssd_w_lat_ms,
+  avg_ssd_lat_ms,
+  max_ssd_r_lat_ms,
+  max_ssd_w_lat_ms,
+  max_ssd_lat_ms,
+  avg_ssd_r_queue_depth_llaw,
+  avg_ssd_w_queue_depth_llaw,
+  avg_ssd_queue_depth_llaw,
+  max_ssd_r_queue_depth_llaw,
+  max_ssd_w_queue_depth_llaw,
+  max_ssd_queue_depth_llaw,
+
+  hdd_count,
+  avg_hdd_r_mbps,
+  avg_hdd_w_mbps,
+  avg_hdd_mbps,
+  max_hdd_r_mbps,
+  max_hdd_w_mbps,
+  max_hdd_mbps,
+  avg_hdd_r_ops,
+  avg_hdd_w_ops,
+  avg_hdd_ops,
+  max_hdd_r_ops,
+  max_hdd_w_ops,
+  max_hdd_ops,
+  avg_hdd_busy_pct,
+  max_hdd_busy_pct,
+  avg_hdd_r_lat_ms,
+  avg_hdd_w_lat_ms,
+  avg_hdd_lat_ms,
+  max_hdd_r_lat_ms,
+  max_hdd_w_lat_ms,
+  max_hdd_lat_ms,
+  avg_hdd_r_queue_depth_llaw,
+  avg_hdd_w_queue_depth_llaw,
+  avg_hdd_queue_depth_llaw,
+  max_hdd_r_queue_depth_llaw,
+  max_hdd_w_queue_depth_llaw,
+  max_hdd_queue_depth_llaw,
+
+  unalign_underlay_ct,
+  unalign_underlay_pause_ct,
+  underlay_pct_of_io,
+  underlay_pause_pct_of_io,
+  unalign_fixable_pct,
+  unalign_unfixable_pct,
+  unalign_maybe_fixable_pct,
+  unalign_offset_pct,
+  unalign_length_pct,
+  unalign_case1_pct,
+  unalign_case2_pct,
+  unalign_case3_pct,
+  unalign_case4_pct,
+  unalign_case5_pct,
+
+  net_inerr_pct,
+  net_retrans_pct,
+  net_inerr_ct,
+  net_retrans_ct,
+  net_inseg_ct,
+  net_outseg_ct,
+
+  unmapZeroCount,
+  unmapZeroBlocks,
+  unmapWriteSameCount,
+  unmapWriteSameBlocks,
+  unmapRequestCount,
+  unmapRequestBlocks,
+
+  replRxBlocks,
+  replRxDataBytes,
+  replTxBlocks,
+  replTxDataBytes,
+
+  xcopyRequestCount,
+  xcopyBlocksCopied,
+  xcopyRequestTime, --can calculate xcopy request latency from this
+
+  odxReadRequestCount,
+  odxReadBlocks,
+  odxReadTime,
+  odxReadPartial,
+  odxWriteRequestCount,
+  odxWriteBlocks,
+  odxWriteTime,
+  odxWritePartial,
+
+  dedupeBlockCount, --from this calculate the proportion of blocks being in burst mode and the deduplication rate of the incoming data
+  dedupeBurstBlockCount,
+  dedupeZeroCount,
+  dedupeableTotalBlocks,
+  dedupeBurstDdupUesBlockCount,
+  dedupeBurstFiNvpgBlockCount,
+  dedupeBurstFiUbSzBlockCount,
+  dedupeBurstLowFlashBlockCount,
+
+  writeAdmitThrottleCount,
+  writeAdmitThrottleTime, --need to know the difference between the write and remote writa and how to determine the proportion of the latency that is due to throttling
+  readAdmitThrottleCount,
+  readAdmitThrottleTime,
+  remoteWriteAdmitThrottleCount,
+  remoteWriteAdmitThrottleTime,
+
+  readAdmitCloseWindowCount,
+  readAdmitForceCloseWindowCount,
+  readAdmitForceOpenWindowCount,
+  readAdmitOpenWindowCount,
+  writeAdmitCloseWindowCount,
+  writeAdmitForceCloseWindowCount,
+  writeAdmitForceOpenWindowCount,
+  writeAdmitOpenWindowCount,
+  remoteWriteAdmitCloseWindowCount,
+  remoteWriteAdmitForceCloseWindowCount,
+  remoteWriteAdmitForceOpenWindowCount,
+  remoteWriteAdmitOpenWindowCount,
+
+  dGcRedEntry,
+  dGcRedExit,
+  fGcRedEntry,
+  fGcRedExit,
+  dGcBytesReapedRED,
+  dGcNumBlkReapedRED,
+  fGcBytesReapedRED,
+  fGcNumBlkReapedRED,
+  busBiFlashWriteRed,
+  busBiRmissFlashRed,
+  busDataFlashWriteRed,
+  busDataRmissFlashRed,
+  busDiFlashWriteRed,
+  busDiRmissFlashRed,
+  busFiFlashWriteRed,
+  busFiRmissFlashRed,
+  busPinnedDataFlashWriteRed,
+  cacheRedCiCount,
+  cacheRedDataCount,
+  cacheRedDiBiCount,
+
+  ioThrottleCount, --general rules for distinguishing between throttling (user created or imposed by background tasks)
+  ioThrottleTime,
+
+  cacheMemLeakTagged,
+  cacheMemLeakReachable,
+  cacheMemLeakDetected,
+  cacheMemLeakHighRefCnt,
+  cacheMemLeakFreed,
+  cacheMemLeakWait,
+  cacheMemLeakCheck,
+  cacheMemLeakCheckStarted,
+
+  numIopsLimitThrottleCnt, --ensure that if this is at the folder or volume level that the throttling will still be captured here
+  numMbpsLimitThrottleCnt,
+  iopsLimitThrottleCycles,
+  mbpsLimitThrottleCycles,
+
+  volume_count,
+  online_volume_count,
+  caching_volume_count,
+  aggressively_caching_volume_count,
+  pinned_volume_count,
+  deduping_volume_count,
+  iops_limit_volume_count,
+  mbps_limit_volume_count,
+  readsVolume,
+  writesVolume,
+  readBytesVolume,
+  writeBytesVolume,
+  encrypted_reads_pct,
+  encrypted_writes_pct,
+  encrypted_readBytes_pct,
+  encrypted_writeBytes_pct,
+  deduping_reads_pct,
+  deduping_writes_pct,
+  deduping_readBytes_pct,
+  deduping_writeBytes_pct,
+  ns_read_from_cached_volumes_pct,
+  seq_read_from_cached_volumes_pct,
+  ns_read_from_aggressively_cached_volumes_pct,
+  seq_read_from_aggressively_cached_volumes_pct,
+  ns_read_from_pinned_volumes_pct,
+  seq_read_from_pinned_volumes_pct,
+  ns_ssd_miss_from_cached_volumes_pct,
+  seq_ssd_miss_from_cached_volumes_pct,
+  ns_ssd_miss_from_aggressively_cached_volumes_pct,
+  seq_ssd_miss_from_aggressively_cached_volumes_pct,
+  ns_ssd_miss_from_pinned_volumes_pct,
+  seq_ssd_miss_from_pinned_volumes_pct,
+  ns_mem_miss_from_cached_volumes_pct,
+  seq_mem_miss_from_cached_volumes_pct,
+  ns_mem_miss_from_aggressively_cached_volumes_pct,
+  seq_mem_miss_from_aggressively_cached_volumes_pct,
+  ns_mem_miss_from_pinned_volumes_pct,
+  seq_mem_miss_from_pinned_volumes_pct,
+  writes_to_deduping_volumes_with_lt_5pct_dedupe_pct,
+  writes_to_deduping_volumes_with_lt_2pct_dedupe_pct,
+  writes_to_deduping_volumes_with_lt_1pct_dedupe_pct,
+  writes_to_deduping_volumes_with_0pct_dedupe_pct,
+  volume_count_1pct_compression,
+  volume_writes_uncompressible_pct,
+  volume_reads_uncompressible_pct,
+  volume_usage_uncompressible_pct,
+  volume_io_with_5pct_unaligment_pct,
+  volume_io_with_10pct_unaligment_pct,
+  volume_io_with_20pct_unaligment_pct,
+  volume_io_with_50pct_unaligment_pct,
+  volume_io_with_80pct_unaligment_pct,
+  volume_io_with_90pct_unaligment_pct,
+  volume_io_with_95pct_unaligment_pct,
+  iops_limit_iops_throttle_pct,
+  mbps_limit_mbps_throttle_pct,
+  iops_limit_cycle_throttle_pct,
+  mbps_limit_cycle_throttle_pct,
+  system_iops_limit_iops_throttle_pct,
+  system_mbps_limit_mbps_throttle_pct,
+  system_iops_limit_cycle_throttle_pct,
+  system_mbps_limit_cycle_throttle_pct,
+  folder_iops_limit_iops_throttle_pct,
+  folder_mbps_limit_mbps_throttle_pct,
+  folder_iops_limit_cycle_throttle_pct,
+  folder_mbps_limit_cycle_throttle_pct,
+  volume_iops_limit_iops_throttle_pct,
+  volume_mbps_limit_mbps_throttle_pct,
+  volume_iops_limit_cycle_throttle_pct,
+  volume_mbps_limit_cycle_throttle_pct,
+  volume_alloc_cpu_busy_pct,
+  ns_mem_miss_pct,
+  seq_mem_miss_pct,
+
+  fUnpinnedData_frxn,
+  fCi_frxn,
+  fBiDi_frxn,
+  fPinnedData_frxn,
+  fClaimed_frxn,
+  fUnclaimed_frxn,
+  fAvailForData_frxn,
+  fAvailForUnpinnedData_frxn,
+  dData_frxn,
+  dDisktop_frxn,
+  dDi_frxn,
+  dBi_frxn,
+  dHeatmap_frxn,
+  dFi_frxn,
+  dFd_frxn,
+  dClaimed_frxn,
+  dUnclaimed_frxn,
+
+
+  redPctGc,
+  redPctFlashGcUe,
+  redPctDiUe,
+  dGcPctLiveLogical,
+  dGcPctLiveDi,
+  ueNumDiDeletions,
+  ueNumDi,
+  uePctDi,
+  vmNumPendingGenDels,
+
+  schedCpuWeightAutogen,
+  schedCpuWeightCISync,
+  schedCpuWeightDbbSync,
+  schedCpuWeightDel,
+  schedCpuWeightDGc,
+  schedCpuWeightDISync,
+  schedCpuWeightFGc,
+  schedCpuWeightFISync,
+  schedCpuWeightPin,
+  schedDiskWeightAutogen,
+  schedDiskWeightCISync,
+  schedDiskWeightDbbSync,
+  schedDiskWeightDel,
+  schedDiskWeightDGc,
+  schedDiskWeightDISync,
+  schedDiskWeightFISync,
+  schedDiskWeightPin,
+  fi_size_gb,
+
+  --peercoral and new classifiers sensors
+  cpuQueueAvgSize,
+  schedQueueSizeDbbSync,
+  schedCpuQueueSizeDbbSync,
+  schedCpuQueueSizeFgIo,
+  atmItdCpuSaturatedCnt,
+  dbbSyncBytes,
+  cacheDataMiss,
+  dGcNumSegAlloc,
+  txnCommitLatCpu,
+  txnCommitPage,
+  iscsiReadTxqLat,
+  iscsiWriteTxqLat,
+  scsiWriteSubmitTime,
+  cacheFiHitMem,
+  cacheFiMiss,
+  cacheAddFiNode,
+  pgPctNv,
+
+--latency severity score calculations
+perf_sev_score("nsNumReadS512B-1k","nsNumReadS1k-2k","nsNumReadS2k-4k","nsNumReadS4k-8k","nsNumReadS8k-16k","nsNumReadS16k-32k","nsNumReadS32k-64k","nsNumReadS64k-128k","nsNumReadS128k-256k","nsNumReadS256k-512k","nsNumReadS512k-max","nsTimeReadS512B-1k","nsTimeReadS1k-2k","nsTimeReadS2k-4k","nsTimeReadS4k-8k","nsTimeReadS8k-16k","nsTimeReadS16k-32k","nsTimeReadS32k-64k","nsTimeReadS64k-128k","nsTimeReadS128k-256k","nsTimeReadS256k-512k","nsTimeReadS512k-max"
+      USING PARAMETERS op_type = 'nsRead', array_type = 'HFA', time_grain = 'hour') AS perf_sev_ns_read_hr,
+perf_sev_score("seqNumReadS512B-1k","seqNumReadS1k-2k","seqNumReadS2k-4k","seqNumReadS4k-8k","seqNumReadS8k-16k","seqNumReadS16k-32k","seqNumReadS32k-64k","seqNumReadS64k-128k","seqNumReadS128k-256k","seqNumReadS256k-512k","seqNumReadS512k-max","seqTimeReadS512B-1k","seqTimeReadS1k-2k","seqTimeReadS2k-4k","seqTimeReadS4k-8k","seqTimeReadS8k-16k","seqTimeReadS16k-32k","seqTimeReadS32k-64k","seqTimeReadS64k-128k","seqTimeReadS128k-256k","seqTimeReadS256k-512k","seqTimeReadS512k-max"
+      USING PARAMETERS op_type = 'seqRead', array_type = 'HFA', time_grain = 'hour') AS perf_sev_seq_read_hr,
+perf_sev_score("numWriteS512B-1k","numWriteS1k-2k","numWriteS2k-4k","numWriteS4k-8k","numWriteS8k-16k","numWriteS16k-32k","numWriteS32k-64k","numWriteS64k-128k","numWriteS128k-256k","numWriteS256k-512k","numWriteS512k-max","timeWriteS512B-1k","timeWriteS1k-2k","timeWriteS2k-4k","timeWriteS4k-8k","timeWriteS8k-16k","timeWriteS16k-32k","timeWriteS32k-64k","timeWriteS64k-128k","timeWriteS128k-256k","timeWriteS256k-512k","timeWriteS512k-max"
+      USING PARAMETERS op_type = 'write', array_type = 'HFA', time_grain = 'hour') AS perf_sev_write_hr,
+
+--latency severity score calculations
+perf_sev_score("nsNumReadS512B-1k","nsNumReadS1k-2k","nsNumReadS2k-4k","nsNumReadS4k-8k","nsNumReadS8k-16k","nsNumReadS16k-32k","nsNumReadS32k-64k","nsNumReadS64k-128k","nsNumReadS128k-256k","nsNumReadS256k-512k","nsNumReadS512k-max","nsTimeReadS512B-1k","nsTimeReadS1k-2k","nsTimeReadS2k-4k","nsTimeReadS4k-8k","nsTimeReadS8k-16k","nsTimeReadS16k-32k","nsTimeReadS32k-64k","nsTimeReadS64k-128k","nsTimeReadS128k-256k","nsTimeReadS256k-512k","nsTimeReadS512k-max"
+      USING PARAMETERS op_type = 'nsRead', array_type = 'HFA', time_grain = 'minute') AS perf_sev_ns_read,
+perf_sev_score("seqNumReadS512B-1k","seqNumReadS1k-2k","seqNumReadS2k-4k","seqNumReadS4k-8k","seqNumReadS8k-16k","seqNumReadS16k-32k","seqNumReadS32k-64k","seqNumReadS64k-128k","seqNumReadS128k-256k","seqNumReadS256k-512k","seqNumReadS512k-max","seqTimeReadS512B-1k","seqTimeReadS1k-2k","seqTimeReadS2k-4k","seqTimeReadS4k-8k","seqTimeReadS8k-16k","seqTimeReadS16k-32k","seqTimeReadS32k-64k","seqTimeReadS64k-128k","seqTimeReadS128k-256k","seqTimeReadS256k-512k","seqTimeReadS512k-max"
+      USING PARAMETERS op_type = 'seqRead', array_type = 'HFA', time_grain = 'minute') AS perf_sev_seq_read,
+perf_sev_score("numWriteS512B-1k","numWriteS1k-2k","numWriteS2k-4k","numWriteS4k-8k","numWriteS8k-16k","numWriteS16k-32k","numWriteS32k-64k","numWriteS64k-128k","numWriteS128k-256k","numWriteS256k-512k","numWriteS512k-max","timeWriteS512B-1k","timeWriteS1k-2k","timeWriteS2k-4k","timeWriteS4k-8k","timeWriteS8k-16k","timeWriteS16k-32k","timeWriteS32k-64k","timeWriteS64k-128k","timeWriteS128k-256k","timeWriteS256k-512k","timeWriteS512k-max"
+      USING PARAMETERS op_type = 'write', array_type = 'HFA', time_grain = 'minute') AS perf_sev_write,
+--resource headroom models
+(rrops+srops)*e.read_iops_coeff + (rwops+swops)*e.write_iops_coeff + (rrmbps+srmbps)*1024*e.read_kbps_coeff + (rwmbps+swmbps)*1024*e.write_kbps_coeff as cpu_headroom_model_engineering,
+(rrops+srops)*i.read_iops_coeff + (rwops+swops)*i.write_iops_coeff + (rrmbps+srmbps)*1024*i.read_kbps_coeff + (rwmbps+swmbps)*1024*i.write_kbps_coeff as cpu_headroom_model_installbase,
+(100*cpu_busy_pct)*ZEROIFNULL(1/NULLIFZERO((rrops+srops)*e.read_iops_coeff + (rwops+swops)*e.write_iops_coeff + (rrmbps+srmbps)*1024*e.read_kbps_coeff + (rwmbps+swmbps)*1024*e.write_kbps_coeff)) as cpu_model_pct_of_actual_engineering,
+(100*cpu_busy_pct)*ZEROIFNULL(1/NULLIFZERO((rrops+srops)*i.read_iops_coeff + (rwops+swops)*i.write_iops_coeff + (rrmbps+srmbps)*1024*i.read_kbps_coeff + (rwmbps+swmbps)*1024*i.write_kbps_coeff)) as cpu_model_pct_of_actual_installbase,
+(cpu_busy_pct) - ((rrops+srops)*e.read_iops_coeff + (rwops+swops)*e.write_iops_coeff + (rrmbps+srmbps)*1024*e.read_kbps_coeff + (rwmbps+swmbps)*1024*e.write_kbps_coeff) as cpu_model_diff_of_actual_engineering,
+(cpu_busy_pct) - ((rrops+srops)*i.read_iops_coeff + (rwops+swops)*i.write_iops_coeff + (rrmbps+srmbps)*1024*i.read_kbps_coeff + (rwmbps+swmbps)*1024*i.write_kbps_coeff) as cpu_model_diff_of_actual_installbase
+from array_lvl_perf_joined_without_duplicates j
+left outer join (select * from reference0.io_headroom_pct_by_system where (source is null or source = 'engineering') and (coalesce(all_flash,true) = coalesce(deduplication_enabled,true))) e on e.system = array_series
+left outer join (select * from reference0.io_headroom_pct_by_system where (source is null or source = 'infosight')   and (coalesce(all_flash,true) = coalesce(deduplication_enabled,true))) i on i.system = array_series
+where array_type = 'HFA';
+
+select * from comp limit 20;
